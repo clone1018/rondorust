@@ -24,10 +24,6 @@ bevy = "0.19"
 rondorust = { version = "0.1", features = ["bevy"] }
 ```
 
-Before the first crates.io release, use
-`rondorust = { git = "https://github.com/clone1018/rondorust", features = ["bevy"] }`
-or a local path dependency.
-
 Register `RondocodePlugin` after `DefaultPlugins`, then load a `.rondo` or
 `.rondocode` asset as a typed `AudioPlayer`:
 
