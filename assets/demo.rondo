@@ -1,0 +1,27 @@
+# An original, synthesis-only tune. One cycle is a bar.
+bpm 120
+level -8
+
+synth bass
+  cutoff = knob 900 80..6000 log
+  saw note / 2
+  ladder cutoff res:.35
+  * adsr .005 .12 .25 .12
+  * .5
+
+synth bell
+  modulator = sine note * 2
+  fm note modulator * .22
+  * adsr .002 .18 0 .08
+  * .3
+  post
+    delay .1875 .35 sync:1 mix:.25
+    reverb room:.55 mix:.15
+
+play bass
+  0 ~ 0 3 5 ~ <3 7> 2 scale:a-min
+
+play bell
+  <[0 2 4 7] [7 4 2 0]> scale:a-min
+  gain: .65
+  every 4: rev
