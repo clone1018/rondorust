@@ -61,6 +61,13 @@ pub(crate) struct Section {
     pub layers: Vec<String>,
     pub plays: Vec<Play>,
 }
+#[derive(Clone, Debug)]
+pub(crate) struct Zone {
+    pub lo: f64,
+    pub hi: f64,
+    pub name: String,
+    pub root: f64,
+}
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Program {
     pub synths: Vec<Synth>,
@@ -68,6 +75,8 @@ pub(crate) struct Program {
     pub buses: Vec<Bus>,
     pub sections: Vec<Section>,
     pub directives: Vec<Line>,
+    pub zones: BTreeMap<String, Vec<Zone>>,
+    pub singing: Vec<crate::SingingRequest>,
 }
 
 pub(crate) fn parse(source: &str) -> Result<Program> {
@@ -119,6 +128,12 @@ pub(crate) fn parse(source: &str) -> Result<Program> {
         match header.word() {
             "synth" => program.synths.push(synth(header, body)?),
             "play" | "beat" => program.plays.push(play(header, body)?),
+            "sing" => {
+                let (synth, play, request) = singing(header, body)?;
+                program.synths.push(synth);
+                program.plays.push(play);
+                program.singing.push(request);
+            }
             "bus" => {
                 let name = identifier(header, 1)?;
                 if header.text.split_whitespace().count() != 2 {
@@ -178,10 +193,16 @@ pub(crate) fn parse(source: &str) -> Result<Program> {
                 while n < body.len() {
                     let h = &body[n];
                     let e = block_end(body, n);
-                    if !matches!(h.word(), "play" | "beat") {
-                        return Err(h.error("sections contain play or beat blocks"));
+                    if h.word() == "sing" {
+                        let (synth, play, request) = singing(h, &body[n + 1..e])?;
+                        program.synths.push(synth);
+                        plays.push(play);
+                        program.singing.push(request);
+                    } else if matches!(h.word(), "play" | "beat") {
+                        plays.push(play(h, &body[n + 1..e])?);
+                    } else {
+                        return Err(h.error("sections contain play, beat or sing blocks"));
                     }
-                    plays.push(play(h, &body[n + 1..e])?);
                     n = e;
                 }
                 program.sections.push(Section {
@@ -191,14 +212,58 @@ pub(crate) fn parse(source: &str) -> Result<Program> {
                     plays,
                 });
             }
-            "js" | "sing" | "visual" | "mask" | "draw" | "out" | "zonedef" => {
+            "zonedef" => {
+                let name = identifier(header, 1)?;
+                if header.text.split_whitespace().count() != 2
+                    || body.is_empty()
+                    || body.len() > 128
+                {
+                    return Err(header.error("zonedef needs a name and 1..128 zone rows"));
+                }
+                let mut zones = Vec::new();
+                for line in body {
+                    let fields: Vec<_> = line.text.split_whitespace().collect();
+                    if fields.len() != 3 {
+                        return Err(line.error("zone row is lo..hi SAMPLE root:NOTE"));
+                    }
+                    let (lo, hi) = fields[0]
+                        .split_once("..")
+                        .ok_or_else(|| line.error("zone needs lo..hi"))?;
+                    let root = fields[2]
+                        .strip_prefix("root:")
+                        .ok_or_else(|| line.error("zone needs root:NOTE"))?;
+                    let pitch = |text: &str| -> Result<f64> {
+                        let n = crate::note_to_midi(text)
+                            .map(Ok)
+                            .unwrap_or_else(|| number(text, line))?;
+                        if !(-256.0..=256.).contains(&n) {
+                            return Err(line.error("zone pitch must be in -256..256"));
+                        }
+                        Ok(n)
+                    };
+                    let (lo, hi, root) = (pitch(lo)?, pitch(hi)?, pitch(root)?);
+                    if lo > hi || !valid_name(fields[1]) {
+                        return Err(line.error("invalid zone range or sample name"));
+                    }
+                    zones.push(Zone {
+                        lo,
+                        hi,
+                        root,
+                        name: fields[1].into(),
+                    });
+                }
+                if program.zones.insert(name, zones).is_some() {
+                    return Err(header.error("duplicate zonedef"));
+                }
+            }
+            "js" | "visual" | "mask" | "draw" => {
                 return Err(header.error(format!(
                     "`{}` is not supported by the native audio renderer",
                     header.word()
                 )));
             }
             "cps" | "bpm" | "timesig" | "level" | "master" | "sidechain" | "stereo" | "macro"
-            | "switch" | "patdef" | "scaledef" | "wavedef" | "curvedef" | "song" => {
+            | "out" | "switch" | "patdef" | "scaledef" | "wavedef" | "curvedef" | "song" => {
                 if !body.is_empty() {
                     return Err(body[0].error("this directive has no indented body"));
                 }
@@ -209,6 +274,115 @@ pub(crate) fn parse(source: &str) -> Result<Program> {
         at = end;
     }
     Ok(program)
+}
+fn singing(header: &Line, body: &[Line]) -> Result<(Synth, Play, crate::SingingRequest)> {
+    let name = identifier(header, 1)?;
+    let fields: Vec<_> = header.text.split_whitespace().collect();
+    let voice = match &fields[2..] {
+        [] => None,
+        [field] => Some(
+            field
+                .strip_prefix("voice:")
+                .filter(|v| valid_name(v))
+                .ok_or_else(|| header.error("sing only accepts voice:NAME"))?
+                .to_owned(),
+        ),
+        _ => return Err(header.error("sing only accepts voice:NAME")),
+    };
+    let post_at = body
+        .iter()
+        .position(|l| l.text == "post")
+        .unwrap_or(body.len());
+    let post = if post_at < body.len() {
+        if body[post_at + 1..].is_empty()
+            || body[post_at + 1..]
+                .iter()
+                .any(|l| l.indent <= body[post_at].indent)
+        {
+            return Err(body[post_at].error("sing post needs effects and must be last"));
+        }
+        Some(chain(
+            &body[post_at + 1..],
+            Some(Expr::Ref("input".into())),
+        )?)
+    } else {
+        None
+    };
+    let body = &body[..post_at];
+    let first_mod = body
+        .iter()
+        .position(|l| crate::song::is_modifier(l, false))
+        .unwrap_or(body.len());
+    let pairs = &body[..first_mod];
+    if pairs.is_empty() || !pairs.len().is_multiple_of(2) {
+        return Err(header.error("sing needs lyric/melody line pairs"));
+    }
+    let lyrics = pairs
+        .iter()
+        .step_by(2)
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let melody = pairs
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .map(|l| l.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    crate::pattern::Pattern::parse(&melody)?;
+    let mut cycles = 1;
+    let mut modifiers = Vec::new();
+    for line in &body[first_mod..] {
+        if let Some(value) = line.text.strip_prefix("cycles:") {
+            let n = number(value.trim(), line)?;
+            if n.fract() != 0. || !(1.0..=4096.).contains(&n) {
+                return Err(line.error("sing cycles must be a whole number in 1..4096"));
+            }
+            cycles = n as usize;
+        } else if line.text.starts_with("scale:") {
+            return Err(line.error("sing melodies use absolute note names; scale does not apply"));
+        } else {
+            modifiers.push(line.clone());
+        }
+    }
+    let request = crate::SingingRequest {
+        name: name.clone(),
+        voice,
+        lyrics,
+        melody,
+        cycles,
+        cps: 0.,
+        sample_rate: 0,
+    };
+    let synth = Synth {
+        name: name.clone(),
+        chain: Chain {
+            bindings: BTreeMap::new(),
+            output: Some(Expr::Call(
+                "sample".into(),
+                vec![Expr::Word(request.sample_name())],
+                BTreeMap::from([("root".into(), Expr::Num(60.))]),
+            )),
+        },
+        post,
+        options: BTreeMap::from([("voices".into(), 1.)]),
+    };
+    let line = |text| Line {
+        text,
+        line: header.line,
+        indent: header.indent + 2,
+    };
+    let mut play_body = vec![line("c4".into()), line(format!("slow {cycles}"))];
+    play_body.extend(modifiers);
+    let play = Play {
+        header: Line {
+            text: format!("play {name}"),
+            ..header.clone()
+        },
+        body: play_body,
+    };
+    Ok((synth, play, request))
 }
 fn block_end(lines: &[Line], at: usize) -> usize {
     let mut end = at + 1;
@@ -631,6 +805,15 @@ fn spec(name: &str) -> Option<Spec> {
             ],
             &[],
         ),
+        "ddsp" => (
+            false,
+            &[true],
+            &[
+                "breath", "vib", "vibrate", "vel", "air", "bright", "scoop", "fall", "level",
+                "dyn", "gain", "attack", "release", "punch", "vibdelay", "flow", "seed",
+            ],
+            &[],
+        ),
         "pluck" => (false, &[false], &["decay", "damp", "seed"], &[]),
         "modal" => (
             false,
@@ -820,7 +1003,7 @@ impl ExpressionParser<'_> {
             }
             Kind::Op('-') => Ok(Expr::bin('*', Expr::Num(-1.0), self.expr(5)?)),
             Kind::Name(name) => match name.as_str() {
-                "js" | "mic" | "sing" | "ddsp" => Err(self
+                "js" | "mic" | "sing" => Err(self
                     .line
                     .error(format!("`{name}` is not implemented in this native port"))),
                 "adsr" => {

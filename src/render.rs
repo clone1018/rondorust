@@ -15,6 +15,7 @@ pub struct RenderOptions {
     pub max_voices: usize,
     pub peak_normalization: bool,
     pub samples: SampleBank,
+    pub resources: crate::HostResources,
 }
 impl Default for RenderOptions {
     fn default() -> Self {
@@ -25,6 +26,7 @@ impl Default for RenderOptions {
             max_voices: 12,
             peak_normalization: true,
             samples: SampleBank::default(),
+            resources: crate::HostResources::default(),
         }
     }
 }
@@ -58,12 +60,13 @@ impl RenderOptions {
     }
 }
 
-/// Interleaved stereo PCM. Cloning shares sample storage.
+/// Interleaved PCM. Cloning shares sample storage.
 #[derive(Clone, Debug)]
 pub struct AudioBuffer {
     samples: Arc<[f32]>,
     sample_rate: u32,
     normalization_gain: f64,
+    channels: usize,
 }
 impl AudioBuffer {
     pub fn samples(&self) -> &[f32] {
@@ -72,8 +75,11 @@ impl AudioBuffer {
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
     pub fn frames(&self) -> usize {
-        self.samples.len() / 2
+        self.samples.len() / self.channels
     }
     pub fn duration(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(self.frames() as f64 / f64::from(self.sample_rate))
@@ -104,10 +110,16 @@ impl Song {
         let normalize = options.peak_normalization;
         let mut stream = self.stream(options)?;
         let sample_rate = stream.sample_rate;
-        let mut samples = Vec::with_capacity(stream.total_frames * 2);
-        while let Some(frame) = stream.frame(false) {
-            samples.push(frame[0]);
-            samples.push(frame[1]);
+        let channels = stream.channels();
+        let sample_count = stream.total_frames * channels;
+        if sample_count > 64 * 1024 * 1024 {
+            return Err(Error::invalid(
+                "offline PCM exceeds 256 MiB; shorten the render or use streaming",
+            ));
+        }
+        let mut samples = Vec::with_capacity(sample_count);
+        while stream.frame(false, true).is_some() {
+            samples.extend_from_slice(&stream.output[..channels]);
         }
         let peak = samples.iter().map(|x| x.abs()).fold(0., f32::max);
         let normalization_gain = if normalize && peak > 0.89 {
@@ -124,13 +136,51 @@ impl Song {
             samples: samples.into(),
             sample_rate,
             normalization_gain,
+            channels,
         })
     }
-    /// Create a finite stream of stereo frames. Scheduling and buffer allocation
+    /// Create a finite stream. The iterator emits stereo; `next_frame` preserves
+    /// all output routes. Scheduling and buffer allocation
     /// finish here; advancing the iterator allocates no heap memory. Streaming
     /// applies a final clip, while offline rendering can normalize the entire mix.
-    pub fn stream(&self, options: RenderOptions) -> Result<AudioStream> {
+    pub fn stream(&self, mut options: RenderOptions) -> Result<AudioStream> {
         let total_frames = options.validate(self.data.cps)?;
+        let phrase_bytes: f64 = self
+            .data
+            .singing
+            .iter()
+            .filter(|r| options.samples.get(&r.sample_name()).is_none())
+            .map(|r| r.cycles as f64 / self.data.cps * f64::from(options.sample_rate) * 4.)
+            .sum();
+        if phrase_bytes > 256. * 1024. * 1024. {
+            return Err(Error::invalid(
+                "sung phrases exceed 256 MiB of estimated PCM",
+            ));
+        }
+        let mut phrase_samples = 0;
+        for request in &self.data.singing {
+            if options.samples.get(&request.sample_name()).is_some() {
+                continue;
+            }
+            if request.cycles as f64 / self.data.cps > 300. {
+                return Err(Error::invalid("a sung phrase may last at most 300 seconds"));
+            }
+            let renderer = options.resources.singing.as_ref().ok_or_else(|| {
+                Error::invalid(format!(
+                    "sing `{}` needs a host SingingRenderer or sample `{}`",
+                    request.name,
+                    request.sample_name()
+                ))
+            })?;
+            let mut request = request.clone();
+            request.sample_rate = options.sample_rate;
+            let sample = renderer.render(&request)?;
+            phrase_samples += sample.data().len();
+            if phrase_samples > 64 * 1024 * 1024 {
+                return Err(Error::invalid("sung phrase exceeds 256 MiB of PCM"));
+            }
+            options.samples.insert(request.sample_name(), sample);
+        }
         let events = self.events(options.cycles)?;
         AudioStream::new(self.data.clone(), events, options, total_frames)
     }
@@ -205,6 +255,7 @@ impl Strip {
                         def.graph.clone(),
                         options.sample_rate,
                         &options.samples,
+                        &options.resources,
                     )?,
                     active: false,
                     gate: false,
@@ -226,7 +277,14 @@ impl Strip {
         let post = def
             .post
             .as_ref()
-            .map(|p| GraphInstance::new(p.clone(), options.sample_rate, &options.samples))
+            .map(|p| {
+                GraphInstance::new(
+                    p.clone(),
+                    options.sample_rate,
+                    &options.samples,
+                    &options.resources,
+                )
+            })
             .transpose()?;
         Ok(Self {
             def: def.clone(),
@@ -451,6 +509,7 @@ pub struct AudioStream {
     duck: f64,
     master_reduction: f64,
     low_side: f64,
+    output: [f32; 32],
 }
 impl AudioStream {
     fn new(
@@ -499,18 +558,19 @@ impl AudioStream {
             .synths
             .iter()
             .map(|s| {
-                (s.graph.storage_bytes(sr, &options.samples) + std::mem::size_of::<Voice>())
+                (s.graph
+                    .storage_bytes(sr, &options.samples, &options.resources)
+                    + std::mem::size_of::<Voice>())
                     * options.max_voices.min(s.voices)
                     + s.post
                         .as_ref()
-                        .map(|g| g.storage_bytes(sr, &options.samples))
+                        .map(|g| g.storage_bytes(sr, &options.samples, &options.resources))
                         .unwrap_or(0)
             })
-            .chain(
-                data.buses
-                    .iter()
-                    .map(|b| b.graph.storage_bytes(sr, &options.samples)),
-            )
+            .chain(data.buses.iter().map(|b| {
+                b.graph
+                    .storage_bytes(sr, &options.samples, &options.resources)
+            }))
             .sum();
         if bytes > 256 * 1024 * 1024 {
             return Err(Error::invalid(
@@ -525,7 +585,7 @@ impl AudioStream {
         let buses = data
             .buses
             .iter()
-            .map(|b| GraphInstance::new(b.graph.clone(), sr, &options.samples))
+            .map(|b| GraphInstance::new(b.graph.clone(), sr, &options.samples, &options.resources))
             .collect::<Result<_>>()?;
         let raw = vec![[0.; 2]; strips.len()];
         Ok(Self {
@@ -541,7 +601,32 @@ impl AudioStream {
             duck: 1.,
             master_reduction: 0.,
             low_side: 0.,
+            output: [0.; 32],
         })
+    }
+    /// Number of interleaved output channels, including unused gaps in `out` routes.
+    pub fn channels(&self) -> usize {
+        self.data
+            .outputs
+            .iter()
+            .map(|r| r.1 + 1)
+            .max()
+            .unwrap_or(2)
+            .max(2)
+    }
+    /// Fill a complete routed frame without allocating. Returns false at EOF.
+    /// The stereo Iterator folds extra routes back into the master pair.
+    pub fn next_frame(&mut self, output: &mut [f32]) -> Result<bool> {
+        if output.len() != self.channels() {
+            return Err(Error::invalid(
+                "output buffer length must equal stream.channels()",
+            ));
+        }
+        if self.frame(true, true).is_none() {
+            return Ok(false);
+        }
+        output.copy_from_slice(&self.output[..output.len()]);
+        Ok(true)
     }
     pub fn remaining_frames(&self) -> usize {
         self.total_frames - self.frame
@@ -573,7 +658,7 @@ impl AudioStream {
         }
         Ok(())
     }
-    fn frame(&mut self, clip: bool) -> Option<[f32; 2]> {
+    fn frame(&mut self, clip: bool, routed: bool) -> Option<[f32; 2]> {
         if self.frame >= self.total_frames {
             return None;
         }
@@ -610,7 +695,7 @@ impl AudioStream {
         for (strip, raw) in self.strips.iter_mut().zip(&mut self.raw) {
             *raw = strip.process(sr, cps);
         }
-        let mut mix = [0.; 2];
+        let mut destination = [0.; 32];
         for (i, raw) in self.raw.iter().enumerate() {
             let multiplier = if let Some(sidechain) = &self.data.sidechain {
                 if i == sidechain.source {
@@ -621,9 +706,12 @@ impl AudioStream {
             } else {
                 1.
             };
-            mix[0] += raw[0] * multiplier;
-            mix[1] += raw[1] * multiplier;
+            let (lo, hi) = self.data.outputs[i];
+            let (lo, hi) = if routed || lo < 2 { (lo, hi) } else { (0, 1) };
+            destination[lo] += raw[0] * multiplier;
+            destination[hi] += raw[1] * multiplier;
         }
+        let mut mix = [destination[0], destination[1]];
         if let Some(sidechain) = &self.data.sidechain {
             self.duck += (1. - self.duck) * (1. - (-1. / (sidechain.release / 1000. * sr)).exp());
         }
@@ -673,21 +761,24 @@ impl AudioStream {
             mix[1] *= gain;
         }
         self.frame += 1;
-        Some(mix.map(|x| {
-            if !x.is_finite() {
+        destination[0] = mix[0];
+        destination[1] = mix[1];
+        for (out, x) in self.output.iter_mut().zip(destination) {
+            *out = if !x.is_finite() {
                 0.
             } else if clip {
                 x.clamp(-1., 1.) as f32
             } else {
                 x.clamp(-1e12, 1e12) as f32
-            }
-        }))
+            };
+        }
+        Some([self.output[0], self.output[1]])
     }
 }
 impl Iterator for AudioStream {
     type Item = [f32; 2];
     fn next(&mut self) -> Option<Self::Item> {
-        self.frame(true)
+        self.frame(true, false)
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         let n = self.remaining_frames();

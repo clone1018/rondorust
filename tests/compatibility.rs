@@ -1,8 +1,8 @@
 //! Language surface fixtures audited against rondocode a604ac8a3046b3c06c0dd0a46f268a521d581dc8.
 use rondorust::{RenderOptions, Sample, SampleBank, Song, pattern::Pattern};
 
-// All 63 native entries in upstream's 65-entry BUILTINS registry. mic/ddsp
-// require external runtime services and are covered by explicit rejections.
+// All 64 supported entries in upstream's 65-entry BUILTINS registry.
+// DDSP uses an explicit host adapter; microphone capture is outside scope.
 const BUILTINS: &[(&str, &str, bool)] = &[
     ("sine", "sine", false),
     ("saw", "saw", false),
@@ -11,7 +11,16 @@ const BUILTINS: &[(&str, &str, bool)] = &[
     ("pulse", "pulse note 0.3", false),
     ("syncsaw", "syncsaw note 2", false),
     ("fm", "fm note 1 feedback:0.1 wave:tri", false),
-    ("wavetable", "wavetable note 0.4 table:basic", false),
+    (
+        "wavetable",
+        "wavetable note 0.4 table:basic warp:sync warpamt:0.3",
+        false,
+    ),
+    (
+        "ddsp",
+        "ddsp violin breath:0 vib:0.1 vibrate:5 vel:0.8 air:0.1 bright:0.2 scoop:0.1 fall:0.1 level:-12 dyn:6 gain:0.2 attack:0.01 release:0.1 punch:0.1 vibdelay:0.1 flow:0.2 seed:1",
+        false,
+    ),
     ("supersaw", "supersaw detune:0.3 mix:0.6", false),
     ("noise", "noise pink", false),
     ("lfsr", "lfsr mode:periodic", false),
@@ -145,6 +154,9 @@ const DIRECTIVES: &[&str] = &[
     "curvedef",
     "scaledef",
     "wavedef",
+    "out",
+    "zonedef",
+    "sing",
 ];
 
 const VOICE_OPTIONS: &[&str] = &[
@@ -250,7 +262,7 @@ fn unknown_controls_and_extra_routing_arguments_do_not_silently_vanish() {
 
 #[test]
 fn native_directives_definitions_and_routes_compile_together() {
-    let source = "bpm 120\ntimesig 4 4\ncps 1\nlevel -3\nmacro amplitude .1 0..1\nswitch tone 1 2\ncurvedef swell 0 .2 1 1\nscaledef quarter cents 0 150 300 period:1200\nwavedef custom 1 .5 / 1 .2\npatdef phrase 0 1\nsynth kick\n  sine 60\n  * adsr .001 .01 0 .01\nsynth x mono glide:.02 unison:1 detune:12 spread:.5 curve:1 blend:1 octaves:0 humanize:.2 voices:4\n  wavetable table:custom\n  * gate\n  * amplitude\n  * tone\n  post\n    delay .005 .2 maxtime:.1 mix:.2\nbus space\n  delay .005 .2 maxtime:.1 mix:.2\n  send x .1\nsidechain kick depth:.3 release:100 x:.5\nmaster threshold:-6 ratio:2 makeup:0\nstereo width:.8 monobelow:100\nsection drums 1\n  beat\n    kick*4\nsection bass 1\n  play x\n    phrase scale:c-quarter\n    gain: shape swell 1\nsection main 1 with drums with bass\n  play main synth:x\n    2 scale:c-quarter\nsong main\nplay lead synth:x\n  c4";
+    let source = "zonedef zones\n  c2..b3 bank root:c3\nout x 3..4\nsing vocal\n  hello\n  c4\nbpm 120\ntimesig 4 4\ncps 1\nlevel -3\nmacro amplitude .1 0..1\nswitch tone 1 2\ncurvedef swell 0 .2 1 1\nscaledef quarter cents 0 150 300 period:1200\nwavedef custom 1 .5 / 1 .2\npatdef phrase 0 1\nsynth kick\n  sine 60\n  * adsr .001 .01 0 .01\nsynth x mono glide:.02 unison:1 detune:12 spread:.5 curve:1 blend:1 octaves:0 humanize:.2 voices:4\n  wavetable table:custom\n  * gate\n  * amplitude\n  * tone\n  post\n    delay .005 .2 maxtime:.1 mix:.2\nbus space\n  delay .005 .2 maxtime:.1 mix:.2\n  send x .1\nsidechain kick depth:.3 release:100 x:.5\nmaster threshold:-6 ratio:2 makeup:0\nstereo width:.8 monobelow:100\nsection drums 1\n  beat\n    kick*4\nsection bass 1\n  play x\n    phrase scale:c-quarter\n    gain: shape swell 1\nsection main 1 with drums with bass\n  play main synth:x\n    2 scale:c-quarter\nsong main\nplay lead synth:x\n  c4";
     for directive in DIRECTIVES {
         assert!(
             source
@@ -272,7 +284,14 @@ fn options() -> RenderOptions {
     let mut samples = SampleBank::new();
     samples.insert("bank", Sample::new(vec![0.1_f32; 800], 8000).unwrap());
     samples.insert("bank:1", Sample::new(vec![0.2_f32; 800], 8000).unwrap());
+    let mut resources = rondorust::HostResources::default();
+    resources.insert_ddsp("violin", std::sync::Arc::new(FixtureDdsp));
+    samples.insert(
+        "__rondo_sing_vocal",
+        Sample::new(vec![0.1_f32; 800], 8000).unwrap(),
+    );
     RenderOptions {
+        resources,
         sample_rate: 8000,
         cycles: 0.05,
         max_voices: 1,
@@ -289,7 +308,7 @@ fn score(voice: &str, chain: &str, notation: &str, mods: &str) -> String {
 
 #[test]
 fn all_native_upstream_builtins_and_named_arguments_compile_and_render() {
-    assert_eq!(BUILTINS.len(), 63);
+    assert_eq!(BUILTINS.len(), 64);
     for &(name, expression, processor) in BUILTINS {
         let chain = if processor {
             format!("noise\n{expression}")
@@ -538,6 +557,11 @@ fn supported_modifier_surface_schedules_without_invalid_note_fallbacks() {
         "arp converge",
         "chop 4",
         "striate 4",
+        "voicing drop2",
+        "voiceLead",
+        "invert 1",
+        "slur 1",
+        "chunk 4 rev",
     ] {
         let source = score("", "sine", "Am7", &format!("  {modifier}"));
         let song = Song::parse(&source).unwrap_or_else(|e| panic!("{modifier}: {e}"));
@@ -557,32 +581,14 @@ fn supported_modifier_surface_schedules_without_invalid_note_fallbacks() {
 fn remaining_native_audio_gaps_fail_explicitly() {
     for source in [
         "synth x\n  mic",
-        "synth x\n  ddsp violin",
         "js\n  anything()",
         "sing vocal",
         "visual\n  anything",
         "mask 1\n  anything",
         "draw 1\n  anything",
         "out midi",
-        "zonedef piano\n  c2..b3 sample root:c3",
-        "synth x\n  wavetable table:harmonic",
-        "synth x\n  wavetable warp:sync",
-        "synth x\n  wavetable warpamt:0.3",
     ] {
         assert!(Song::parse(source).is_err(), "{source}");
-    }
-    for modifier in [
-        "voicing drop2",
-        "voiceLead",
-        "invert 1",
-        "slur 4",
-        "chunk 4 rev",
-        "overchord: Am7",
-    ] {
-        assert!(
-            Song::parse(&score("", "sine", "Am7", &format!("  {modifier}"))).is_err(),
-            "{modifier}"
-        );
     }
     for modifier in [
         "fast <1 2>",
@@ -606,6 +612,7 @@ fn malformed_modifier_arguments_and_bare_timing_lanes_are_rejected() {
         "echo 3 0.2 0.5 extra",
         "arp wrong",
         "cycles: 1.5",
+        "slur 4",
     ] {
         assert!(
             Song::parse(&score("", "sine", "c4", &format!("  {modifier}"))).is_err(),
@@ -860,5 +867,30 @@ fn unison_curve_blend_and_octave_options_change_audio_as_documented() {
             Song::parse(&score(voice, "sine", "a4", "")).is_err(),
             "{voice}"
         );
+    }
+}
+
+#[derive(Debug)]
+struct FixtureDdsp;
+impl rondorust::DdspFactory for FixtureDdsp {
+    fn storage_bytes(&self, _: &rondorust::DdspSettings, _: u32) -> usize {
+        0
+    }
+    fn create(
+        &self,
+        _: &rondorust::DdspSettings,
+        _: u32,
+    ) -> rondorust::Result<Box<dyn rondorust::DdspVoice>> {
+        Ok(Box::new(FixtureDdsp))
+    }
+}
+impl rondorust::DdspVoice for FixtureDdsp {
+    fn reset(&mut self) {}
+    fn process(&mut self, frame: rondorust::DdspFrame) -> [f64; 2] {
+        [if frame.gate {
+            frame.frequency * 0.0001
+        } else {
+            0.
+        }; 2]
     }
 }

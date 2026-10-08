@@ -32,28 +32,37 @@ def audit(upstream: Path) -> dict:
     native = dict((name, expression) for name, expression in re.findall(
         r'\(\s*"(\w+)",\s*"((?:[^"\\]|\\.)*)",\s*(?:true|false),?\s*\)', fixture_array("BUILTINS")
     ))
-    external = {"mic", "ddsp"}
+    external = {"mic"}
+    host_builtins = {"ddsp"}
+    host_directives = {"sing"}
     gaps = []
     builtins = []
     option_count = 0
     native_option_count = 0
+    host_option_count = 0
     for i, match in enumerate(entries):
         name = match.group(1)
         spec = registry[match.end():entries[i+1].start() if i+1 < len(entries) else len(registry)]
         named = re.search(r"named:\s*\{(.*?)\}", spec, re.DOTALL)
         options = re.findall(r"(\w+):\s*'(?:sig|num|enum|bool)'", named.group(1)) if named else []
         option_count += len(options)
-        status = "external runtime unsupported" if name in external else "native fixture"
+        if name in external:
+            status = "excluded by scope"
+        elif name in host_builtins:
+            status = "host adapter fixture"
+        else:
+            status = "native fixture"
         if name not in external and name not in native:
             gaps.append(f"builtin {name} has no fixture")
             status = "uncovered"
         missing_options = [option for option in options if name not in external
-                           and f"{option}:" not in native.get(name, "")
-                           and (name, option) not in {("wavetable", "warp"), ("wavetable", "warpamt")}]
+                           and f"{option}:" not in native.get(name, "")]
         gaps.extend(f"{name}.{option} has no fixture" for option in missing_options)
-        excluded_options = options if name in external else [option for option in options
-                            if (name, option) in {("wavetable", "warp"), ("wavetable", "warpamt")}]
-        native_option_count += len(options) - len(excluded_options) - len(missing_options)
+        excluded_options = options if name in external else []
+        covered_options = len(options) - len(excluded_options) - len(missing_options)
+        native_option_count += covered_options
+        if name in host_builtins:
+            host_option_count += covered_options
         builtins.append({"name": name, "status": status, "named_options": options,
                          "unsupported_named_options": excluded_options})
     parser = (upstream / "packages/rondo/src/parser.ts").read_text()
@@ -61,7 +70,7 @@ def audit(upstream: Path) -> dict:
         r"BLOCK_KEYWORDS:.*?=\s*\[(.*?)\]", parser, re.DOTALL
     ).group(1))
     supported = strings(fixture_array("DIRECTIVES"))
-    excluded = {"sing", "out", "zonedef", "visual", "mask", "draw", "js"}
+    excluded = {"visual", "mask", "draw", "js"}
     gaps.extend(f"directive {name} has no classification" for name in directives
                 if name not in supported and name not in excluded)
     combs = re.findall(r"'([^']+)'", re.search(
@@ -72,11 +81,10 @@ def audit(upstream: Path) -> dict:
     ).group(1), re.MULTILINE)
     combinators = sorted({name.lower() for name in combs + fn_combs})
     positive = re.search(r"fn supported_modifier_surface.*?for modifier in \[(.*?)\]", fixtures, re.DOTALL).group(1)
-    negative = re.search(r"fn remaining_native_audio_gaps.*?for modifier in \[(.*?)\]", fixtures, re.DOTALL).group(1)
     native_modifiers = {s.split()[0].rstrip(':').lower() for s in strings(positive)}
-    unsupported_modifiers = {s.split()[0].rstrip(':').lower() for s in strings(negative)}
+    unsupported_modifiers = set(combinators) - native_modifiers
     for name in combinators:
-        if name not in native_modifiers and name not in unsupported_modifiers:
+        if name not in native_modifiers:
             gaps.append(f"modifier {name} has no fixture")
     voice_flags = re.findall(r"'([^']+)'", re.search(r"VOICE_FLAGS:.*?new Set\(\[(.*?)\]\)", parser).group(1))
     voice_options = re.findall(r"'([^']+)'", re.search(r"VOICE_OPTS:.*?new Set\(\[(.*?)\]\)", parser).group(1))
@@ -106,9 +114,15 @@ def audit(upstream: Path) -> dict:
     return {
         "reference": reference, "checkout": revision,
         "builtin_count": len(entries), "named_option_count": option_count,
-        "native_named_option_count": native_option_count,
-        "native_builtin_count": len(native),
-        "directive_count": len(directives), "native_directive_count": len(supported),
+        "supported_named_option_count": native_option_count,
+        "native_named_option_count": native_option_count - host_option_count,
+        "host_named_option_count": host_option_count,
+        "supported_builtin_count": len(native),
+        "native_builtin_count": len(native.keys() - host_builtins),
+        "host_builtin_count": len(native.keys() & host_builtins),
+        "directive_count": len(directives), "supported_directive_count": len(supported),
+        "native_directive_count": len(set(supported) - host_directives),
+        "host_directive_count": len(set(supported) & host_directives),
         "modifier_count": len(combinators), "modifiers": combinators,
         "native_modifier_count": len(set(combinators) & native_modifiers),
         "unsupported_modifiers": sorted(set(combinators) & unsupported_modifiers),

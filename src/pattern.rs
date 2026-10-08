@@ -67,6 +67,7 @@ enum Node {
     Swing(Pattern, f64, usize),
     Humanize(Pattern, f64, usize, u64),
     OnsetsOnly(Pattern),
+    CycleCat(Pattern, usize),
     Sequence(Vec<(Pattern, f64)>),
     Stack(Vec<Pattern>),
     Alternate(Vec<Pattern>),
@@ -153,6 +154,9 @@ impl Pattern {
     }
     fn num(n: f64) -> Self {
         Self::atom(Value::Number(n))
+    }
+    pub(crate) fn chunk_clock(&self, count: usize) -> Self {
+        Self::new(Node::CycleCat(self.clone(), count))
     }
     pub fn stack(patterns: Vec<Self>) -> Self {
         Self::new(Node::Stack(patterns))
@@ -459,6 +463,21 @@ impl Pattern {
                                 break;
                             }
                             pick -= weight;
+                        }
+                    }
+                }
+            }
+            Node::CycleCat(child, count) => {
+                for cycle in span.begin.floor() as i64..span.end.ceil() as i64 {
+                    spend(budget)?;
+                    let c = cycle as f64;
+                    if let Some(part) = span.intersect(TimeSpan {
+                        begin: c,
+                        end: c + 1.,
+                    }) {
+                        let shift = c - cycle.div_euclid(*count as i64) as f64;
+                        for h in child.eval(part.map(|t| t - shift), budget, depth + 1)? {
+                            out.push(h.map(|t| t + shift));
                         }
                     }
                 }

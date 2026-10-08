@@ -32,6 +32,7 @@ impl Decodable for RondocodeAudioSource {
         RondocodeDecoder {
             samples: self.audio.shared_samples(),
             cursor: 0,
+            channels: self.audio.channels() as u16,
             sample_rate: SampleRate::new(self.audio.sample_rate()).expect("validated sample rate"),
         }
     }
@@ -43,6 +44,7 @@ pub struct RondocodeDecoder {
     samples: Arc<[f32]>,
     cursor: usize,
     sample_rate: SampleRate,
+    channels: u16,
 }
 impl Iterator for RondocodeDecoder {
     type Item = f32;
@@ -69,14 +71,15 @@ impl Source for RondocodeDecoder {
         })
     }
     fn channels(&self) -> ChannelCount {
-        ChannelCount::new(2).expect("two channels")
+        ChannelCount::new(self.channels).expect("validated channel count")
     }
     fn sample_rate(&self) -> SampleRate {
         self.sample_rate
     }
     fn total_duration(&self) -> Option<Duration> {
         Some(Duration::from_secs_f64(
-            (self.samples.len() / 2) as f64 / f64::from(self.sample_rate.get()),
+            (self.samples.len() / self.channels as usize) as f64
+                / f64::from(self.sample_rate.get()),
         ))
     }
     fn try_seek(
@@ -84,7 +87,8 @@ impl Source for RondocodeDecoder {
         position: Duration,
     ) -> std::result::Result<(), rodio::source::SeekError> {
         let frame = (position.as_secs_f64() * f64::from(self.sample_rate.get())) as usize;
-        self.cursor = frame.min(self.samples.len() / 2) * 2;
+        self.cursor =
+            frame.min(self.samples.len() / self.channels as usize) * self.channels as usize;
         Ok(())
     }
 }

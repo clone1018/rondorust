@@ -26,12 +26,40 @@ pub(crate) struct Graph {
     pub silence_window: f64,
 }
 impl Graph {
-    pub fn storage_bytes(&self, sr: u32, bank: &SampleBank) -> usize {
+    pub fn storage_bytes(
+        &self,
+        sr: u32,
+        bank: &SampleBank,
+        resources: &crate::HostResources,
+    ) -> usize {
         let sr = sr as usize;
         self.nodes
             .iter()
             .map(|node| {
                 let samples = match &node.op {
+                    Op::Ddsp(settings) => resources
+                        .ddsp
+                        .get(&settings.instrument)
+                        .map(|f| {
+                            f.storage_bytes(settings, sr as u32)
+                                .min(256 * 1024 * 1024 + 1)
+                                .div_ceil(8)
+                        })
+                        .unwrap_or(0),
+                    Op::Sample { name, zones, .. } => {
+                        let count = |name: &str| {
+                            usize::from(bank.get(name).is_some())
+                                + (1..=128)
+                                    .take_while(|i| bank.get(&format!("{name}:{i}")).is_some())
+                                    .count()
+                        };
+                        let handles = if zones.is_empty() {
+                            count(name)
+                        } else {
+                            zones.iter().map(|z| count(&z.name)).sum()
+                        };
+                        handles * std::mem::size_of::<Sample>().div_ceil(8) + zones.len() * 2
+                    }
                     Op::Delay { max, .. } => (sr as f64 * max).ceil() as usize * 2 + 4,
                     Op::Comb(_) => sr / 20 * 2 + 4,
                     Op::Pluck { .. } => sr / 20 + 4,
@@ -247,11 +275,14 @@ enum Op {
         damp: f64,
         seed: u32,
     },
+    Ddsp(crate::DdspSettings),
     Wavetable {
-        frames: Arc<Vec<Vec<f64>>>,
+        table: Arc<crate::wavetable::TableBank>,
+        warp: String,
     },
     Sample {
         name: String,
+        zones: Vec<crate::language::Zone>,
         root: f64,
         looped: bool,
         start: f64,
@@ -299,7 +330,8 @@ enum Op {
 pub(crate) fn compile(
     chain: &Chain,
     macros: &BTreeMap<String, Expr>,
-    waves: &BTreeMap<String, Vec<Vec<f64>>>,
+    waves: &BTreeMap<String, Arc<crate::wavetable::TableBank>>,
+    zones: &BTreeMap<String, Vec<crate::language::Zone>>,
 ) -> Result<Arc<Graph>> {
     let mut compiler = Compiler {
         nodes: Vec::new(),
@@ -307,6 +339,7 @@ pub(crate) fn compile(
         bindings: &chain.bindings,
         macros,
         waves,
+        zones,
         cache: BTreeMap::new(),
         visiting: BTreeSet::new(),
         tail: 0.1,
@@ -347,7 +380,8 @@ struct Compiler<'a> {
     params: Vec<Param>,
     bindings: &'a BTreeMap<String, Expr>,
     macros: &'a BTreeMap<String, Expr>,
-    waves: &'a BTreeMap<String, Vec<Vec<f64>>>,
+    waves: &'a BTreeMap<String, Arc<crate::wavetable::TableBank>>,
+    zones: &'a BTreeMap<String, Vec<crate::language::Zone>>,
     cache: BTreeMap<String, usize>,
     visiting: BTreeSet<String>,
     tail: f64,
@@ -696,25 +730,67 @@ impl Compiler<'_> {
                     seed: num("seed", 0x1a2b3c4d_u32 as f64)? as u32,
                 }
             }
+            "ddsp" => {
+                let instrument = args
+                    .first()
+                    .map(enum_word)
+                    .transpose()?
+                    .ok_or_else(|| Error::invalid("ddsp needs an instrument"))?;
+                inputs.push(self.node(Op::Gate, vec![])?);
+                inputs.push(self.node(Op::Frequency, vec![])?);
+                for (key, default) in [
+                    ("breath", 0.),
+                    ("vib", 0.),
+                    ("vibrate", 5.),
+                    ("air", 0.),
+                    ("bright", 0.),
+                    ("scoop", 0.),
+                    ("fall", 0.),
+                ] {
+                    inputs.push(self.named(named, key, default)?);
+                }
+                inputs.push(if let Some(vel) = named.get("vel") {
+                    self.expr(vel, None)?
+                } else {
+                    self.node(Op::Velocity, vec![])?
+                });
+                let mut options = BTreeMap::new();
+                for key in [
+                    "level", "dyn", "gain", "attack", "release", "punch", "vibdelay", "flow",
+                    "seed",
+                ] {
+                    if named.contains_key(key) {
+                        options.insert(key.into(), num(key, 0.)?);
+                    }
+                }
+                self.tail = self.tail.max(
+                    options
+                        .get("release")
+                        .copied()
+                        .unwrap_or(0.2)
+                        .clamp(0., 60.),
+                );
+                Op::Ddsp(crate::DdspSettings {
+                    instrument,
+                    options,
+                })
+            }
             "wavetable" => {
                 let table = word("table", "basic")?;
-                let frames = self
+                let table = self
                     .waves
                     .get(&table)
                     .cloned()
-                    .or_else(|| {
-                        (table == "basic")
-                            .then(|| vec![vec![1.], (1..=32).map(|i| 1. / i as f64).collect()])
-                    })
+                    .or_else(|| crate::wavetable::TableBank::preset(&table))
                     .ok_or_else(|| Error::invalid(format!("unknown wavetable `{table}`")))?;
-                if named.contains_key("warp") || named.contains_key("warpamt") {
-                    return Err(Error::invalid("wavetable warping is not implemented"));
+                let warp = word("warp", "none")?;
+                if !matches!(warp.as_str(), "none" | "sync" | "bend" | "mirror") {
+                    return Err(Error::invalid("unknown wavetable warp"));
                 }
                 inputs.push(self.arg(args, 0, Expr::Ref("note".into()))?);
                 inputs.push(self.arg(args, 1, Expr::Num(0.))?);
-                Op::Wavetable {
-                    frames: Arc::new(frames),
-                }
+                inputs.push(self.named(named, "warpamt", 0.5)?);
+                Op::Wavetable { table, warp }
             }
             "sample" => {
                 let name = args
@@ -736,6 +812,7 @@ impl Compiler<'_> {
                     return Err(Error::invalid("sample slices must be in 1..4096"));
                 }
                 Op::Sample {
+                    zones: self.zones.get(&name).cloned().unwrap_or_default(),
                     name,
                     root: num("root", 60.)?,
                     looped: num("loop", 0.)? != 0.,
@@ -1033,6 +1110,7 @@ struct State {
     samples: Vec<Sample>,
     extra: Vec<f64>,
     convolver: Option<Box<crate::convolution::Convolver>>,
+    neural: Option<Box<dyn crate::DdspVoice>>,
     rng: u32,
     seed: u32,
     stage: usize,
@@ -1043,7 +1121,13 @@ struct State {
     previous_gate: bool,
 }
 impl State {
-    fn new(op: &Op, sr: f64, bank: &SampleBank, right_spread: bool) -> Result<Self> {
+    fn new(
+        op: &Op,
+        sr: f64,
+        bank: &SampleBank,
+        resources: &crate::HostResources,
+        right_spread: bool,
+    ) -> Result<Self> {
         let seed = match op {
             Op::Pluck { seed, .. } => *seed,
             Op::Noise(_) => 0x9e3779b9,
@@ -1070,6 +1154,22 @@ impl State {
                         .ok_or_else(|| Error::MissingSample(name.clone()))?,
                     sr as u32,
                 )?))
+            } else {
+                None
+            },
+            neural: if let Op::Ddsp(settings) = op {
+                Some(
+                    resources
+                        .ddsp
+                        .get(&settings.instrument)
+                        .ok_or_else(|| {
+                            Error::invalid(format!(
+                                "ddsp `{}` needs a host DdspFactory",
+                                settings.instrument
+                            ))
+                        })?
+                        .create(settings, sr as u32)?,
+                )
             } else {
                 None
             },
@@ -1117,19 +1217,32 @@ impl State {
         state.positions = vec![0; sizes.len()];
         state.ring = sizes.into_iter().map(|n| vec![0.; n]).collect();
         if let Op::Sample { name, .. } | Op::Granular { name, .. } = op {
-            if let Some(sample) = bank.get(name) {
-                state.samples.push(sample.clone());
-            }
-            for i in 1..=128 {
-                let key = format!("{name}:{i}");
-                if let Some(sample) = bank.get(&key) {
-                    state.samples.push(sample.clone());
-                } else {
-                    break;
+            let names: Vec<&str> = match op {
+                Op::Sample { zones, .. } if !zones.is_empty() => {
+                    zones.iter().map(|z| z.name.as_str()).collect()
                 }
-            }
-            if state.samples.is_empty() {
-                return Err(Error::MissingSample(name.clone()));
+                _ => vec![name],
+            };
+            for name in names {
+                let offset = state.samples.len();
+                if let Some(sample) = bank.get(name) {
+                    state.samples.push(sample.clone());
+                }
+                for i in 1..=128 {
+                    if let Some(sample) = bank.get(&format!("{name}:{i}")) {
+                        state.samples.push(sample.clone());
+                    } else {
+                        break;
+                    }
+                }
+                if state.samples.len() == offset {
+                    return Err(Error::MissingSample(name.into()));
+                }
+                if matches!(op, Op::Sample { zones, .. } if !zones.is_empty()) {
+                    state
+                        .extra
+                        .extend([offset as f64, (state.samples.len() - offset) as f64]);
+                }
             }
         }
         state.reset(op);
@@ -1172,6 +1285,9 @@ impl State {
         Ok(state)
     }
     fn reset(&mut self, op: &Op) {
+        if let Some(neural) = &mut self.neural {
+            neural.reset();
+        }
         self.phase.fill(0.);
         self.mem = [[0.; 32]; 2];
         for r in &mut self.ring {
@@ -1195,6 +1311,7 @@ impl State {
                 }
             }
             Op::Ott { .. } | Op::Eq(_) => {}
+            Op::Sample { zones, .. } if !zones.is_empty() => {}
             _ => self.extra.fill(0.),
         }
         if matches!(op, Op::Tape { .. }) {
@@ -1243,11 +1360,16 @@ pub(crate) struct Context {
     pub end: f64,
 }
 impl GraphInstance {
-    pub fn new(graph: Arc<Graph>, sr: u32, bank: &SampleBank) -> Result<Self> {
+    pub fn new(
+        graph: Arc<Graph>,
+        sr: u32,
+        bank: &SampleBank,
+        resources: &crate::HostResources,
+    ) -> Result<Self> {
         let states = graph
             .nodes
             .iter()
-            .map(|n| State::new(&n.op, f64::from(sr), bank, true))
+            .map(|n| State::new(&n.op, f64::from(sr), bank, resources, true))
             .collect::<Result<Vec<_>>>()?;
         let values = vec![[0.; 2]; graph.nodes.len()];
         let params = graph.params.iter().map(|p| p.default).collect();
@@ -1920,27 +2042,38 @@ impl GraphInstance {
                     s.level = y;
                     out = [y; 2];
                 }
-                Op::Wavetable { frames } => {
-                    let position = input(1, 0).clamp(0., 1.) * (frames.len() - 1) as f64;
-                    let a = position.floor() as usize;
-                    let b = (a + 1).min(frames.len() - 1);
-                    let f = position - a as f64;
+                Op::Ddsp(_) => {
+                    out = s.neural.as_mut().unwrap().process(crate::DdspFrame {
+                        gate: input(0, 0) > 0.5,
+                        frequency: input(1, 0),
+                        breath: input(2, 0),
+                        vib: input(3, 0),
+                        vibrate: input(4, 0),
+                        air: input(5, 0),
+                        bright: input(6, 0),
+                        scoop: input(7, 0),
+                        fall: input(8, 0),
+                        velocity: input(9, 0),
+                    });
+                }
+                Op::Wavetable { table, warp } => {
+                    let amount = input(2, 0).clamp(0., 1.);
+                    let phase = s.phase[0];
+                    let (warped, rate) = match warp.as_str() {
+                        "sync" => ((phase * (1. + 3. * amount)).fract(), 1. + 3. * amount),
+                        "bend" => (phase.powf(1. + 3. * amount), 1. + 3. * amount),
+                        "mirror" => (
+                            phase + amount * (1. - (2. * phase - 1.).abs() - phase),
+                            1. + amount,
+                        ),
+                        _ => (phase, 1.),
+                    };
                     let frequency = input(0, 0);
-                    let mut y = 0.;
-                    let mut norm = 0.;
-                    for n in 0..frames[a].len().max(frames[b].len()) {
-                        if (n + 1) as f64 * frequency.abs() >= sr * 0.49 {
-                            break;
-                        }
-                        let amp = frames[a].get(n).copied().unwrap_or(0.) * (1. - f)
-                            + frames[b].get(n).copied().unwrap_or(0.) * f;
-                        y += amp * (TAU * s.phase[0] * (n + 1) as f64).sin();
-                        norm += amp.abs();
-                    }
-                    out = [y / norm.max(1.); 2];
-                    s.phase[0] = (s.phase[0] + frequency / sr).rem_euclid(1.);
+                    out = [table.sample(warped, input(1, 0), frequency, sr, rate); 2];
+                    s.phase[0] = (phase + frequency / sr).rem_euclid(1.);
                 }
                 Op::Sample {
+                    zones,
                     root,
                     looped,
                     start,
@@ -1954,6 +2087,20 @@ impl GraphInstance {
                     if gate && !s.previous_gate {
                         s.stage = 1;
                         s.segment = (input(3, 0).max(0.).floor() as usize) % s.samples.len();
+                        s.mem[0][0] = *root;
+                        if !zones.is_empty() {
+                            let midi = 69. + 12. * (input(1, 0).max(1e-30) / 440.).log2();
+                            if let Some((i, zone)) = zones.iter().enumerate().find(|(_, z)| {
+                                (midi + 0.5).floor() >= z.lo && (midi + 0.5).floor() <= z.hi
+                            }) {
+                                s.segment = s.extra[i * 2] as usize
+                                    + (input(3, 0).max(0.).floor() as usize)
+                                        % s.extra[i * 2 + 1] as usize;
+                                s.mem[0][0] = zone.root;
+                            } else {
+                                s.stage = 0;
+                            }
+                        }
                         let sample = &s.samples[s.segment];
                         let mut lo = start.max(ctx.begin);
                         let mut hi = end.min(ctx.end);
@@ -1984,7 +2131,7 @@ impl GraphInstance {
                         y *= ((p - lo) / fade_samples)
                             .min((hi - p) / fade_samples)
                             .clamp(0., 1.);
-                        let step = (ctx.frequency / crate::midi_to_frequency(*root))
+                        let step = (ctx.frequency / crate::midi_to_frequency(s.mem[0][0]))
                             * f64::from(sample.sample_rate)
                             / sr
                             * input(2, 0);

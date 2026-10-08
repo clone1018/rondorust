@@ -133,10 +133,11 @@ impl Convolver {
     }
 }
 
-fn fft(values: &mut Spectrum, inverse: bool) {
+pub(crate) fn fft(values: &mut [[f64; 2]], inverse: bool) {
+    let n = values.len();
     let mut j = 0;
-    for i in 1..N {
-        let mut bit = N >> 1;
+    for i in 1..n {
+        let mut bit = n >> 1;
         while j & bit != 0 {
             j ^= bit;
             bit >>= 1;
@@ -147,10 +148,10 @@ fn fft(values: &mut Spectrum, inverse: bool) {
         }
     }
     let mut len = 2;
-    while len <= N {
+    while len <= n {
         let angle = TAU / len as f64 * if inverse { 1. } else { -1. };
         let root = [angle.cos(), angle.sin()];
-        for offset in (0..N).step_by(len) {
+        for offset in (0..n).step_by(len) {
             let mut w = [1., 0.];
             for k in 0..len / 2 {
                 let a = values[offset + k];
@@ -168,8 +169,8 @@ fn fft(values: &mut Spectrum, inverse: bool) {
     }
     if inverse {
         for value in values {
-            value[0] /= N as f64;
-            value[1] /= N as f64;
+            value[0] /= n as f64;
+            value[1] /= n as f64;
         }
     }
 }

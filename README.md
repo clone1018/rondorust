@@ -2,7 +2,7 @@
 
 Native Rust synthesis for [rondocode](https://github.com/vijaypemmaraju/rondocode)'s
 indentation-based **rondo** language, with an optional Bevy audio source and asset
-loader. Parse a score, schedule its patterns, and render stereo PCM entirely in
+loader. Parse a score, schedule its patterns, and render PCM entirely in
 Rust. There is no JavaScript engine, TypeScript compiler, browser, Node process,
 or subprocess involved in rendering.
 
@@ -57,7 +57,7 @@ fn music(mut commands: Commands, assets: Res<AssetServer>) {
 
 Copy [`assets/demo.rondo`](assets/demo.rondo) to your game's assets directory.
 Bevy renders the score during asynchronous asset loading. Playback reads shared
-PCM through independent stereo decoders, supports seeking, and works with
+PCM through independent decoders, supports seeking, and works with
 Bevy's volume, speed, loop, and spatial playback settings. There is no synthesis
 or parsing on the audio thread. Each asset contains the configured finite number
 of cycles; Bevy can loop that buffer. Loading options belong to the plugin and
@@ -91,7 +91,7 @@ fn main() -> rondorust::Result<()> {
 }
 ```
 
-The `rondorust` command writes a 16-bit stereo WAV without Bevy or an audio
+The `rondorust` command writes a 16-bit PCM WAV without Bevy or an audio
 device. With just an input file, it writes a `.wav` next to the input:
 
 ```sh
@@ -158,15 +158,15 @@ retain shared delay/reverb tails.
 | Area | Implemented |
 | --- | --- |
 | Score structure | `synth`, `play`, `beat`, `post`, `bus`/`send`, layered `section` blocks and `song` arrangements |
-| Definitions and mixing | `bpm`, `cps`, `timesig`, `level`, `master`, `sidechain`, `stereo`, `macro`, `switch`, `patdef`, `scaledef`, `wavedef`, `curvedef` |
+| Definitions and mixing | `bpm`, `cps`, `timesig`, `level`, `master`, `sidechain`, `stereo`, `macro`, `switch`, `patdef`, `scaledef`, `wavedef`, `curvedef`, `zonedef`, `out` |
 | Expressions | Named bindings, arithmetic with precedence and parentheses, `knob`, `switch`, `sum` loops, `note`, `gate`, `input`, and mathematical processors |
-| Oscillators | `sine`, `saw`, `square`, `tri`, `pulse`, `syncsaw`, `fm`, `supersaw`, basic/custom harmonic `wavetable`, `noise`, `lfsr`, `lfo` |
-| Sources and envelopes | `sample`, `granular`, `pluck`, `modal`, `adsr`, breakpoint `env` |
+| Oscillators | `sine`, `saw`, `square`, `tri`, `pulse`, `syncsaw`, `fm`, `supersaw`, `wavetable` (`basic`, `harmonic`, `pwm`, custom spectra; `sync`/`bend`/`mirror` warps), `noise`, `lfsr`, `lfo` |
+| Sources and envelopes | `sample`, `granular`, `pluck`, `modal`, `adsr`, breakpoint `env`; host-backed `ddsp` and `sing` |
 | Filtering and dynamics | `svf`, `dualsvf`, `ladder`, `onepole`, `formant`, `eq`, `compress`, `limiter`, `follow`, `noisegate`, `transient`, `deess`, `ott` |
 | Effects | `delay`, `comb`, Freeverb `reverb`, partitioned FFT `convolve`, `chorus`, `flanger`, `phaser`, `pitchshift`, `vocoder`, `looper`, `tape`, `exciter`, `bitcrush`, `shape`, `pan`, `width` |
 | Mini notation | Nested sequences `[]`, stacks `,`, weighted alternation `<>` and choice `\|`, rests `~`, weights `@`, elongation `_`, repetition `!`, speed `*`/`/`, Euclidean rhythms (negative pulses invert), ranges, dot groups, polymeters, degradation `?`, inline `$name` motifs, and group timing lanes |
-| Pattern modifiers | `rev`, `fast`, `slow`, `early`, `late`, `euclid`, `euclidinv`, `ply`, `roll`, `iter`, `iterback`, `segment`, `struct`, `mask`, `linger`, `palindrome`, `degrade`, `degradeby`, `undegradeby`, `every`, `off`, `superimpose`, `jux`, `juxby`, `sometimes`, `sometimesby`, `often`, `rarely`, `always`, `add`, `sub`, `mul`, `div`, `octave`, `swing`, `swingby`, `humanizeby`, `echo`, `ping`, `onsetsonly`, `arp`, `chop`, `striate` |
-| Pitch and controls | All 16 built-in scale families and seven short aliases, custom scales, microtonal cents/ratios/EDO, chords with slash basses, `irand N [seg:M]` random degrees, gain/duration/pan, mini control patterns, continuous control signals, named curves, and per-note lanes such as `0'gain:.8'cutoff:900` |
+| Pattern modifiers | `rev`, `fast`, `slow`, `early`, `late`, `euclid`, `euclidinv`, `ply`, `roll`, `iter`, `iterback`, `segment`, `struct`, `mask`, `linger`, `palindrome`, `degrade`, `degradeby`, `undegradeby`, `every`, `off`, `superimpose`, `jux`, `juxby`, `sometimes`, `sometimesby`, `often`, `rarely`, `always`, `add`, `sub`, `mul`, `div`, `octave`, `swing`, `swingby`, `humanizeby`, `echo`, `ping`, `onsetsonly`, `arp`, `chop`, `striate`, `chunk`, `invert`, `voicing`, `voicelead`, `slur` |
+| Pitch and controls | All 16 built-in scale families and seven short aliases, custom scales, microtonal cents/ratios/EDO, chords with slash basses, `overchord:` chord-degree mapping, `irand N [seg:M]` random degrees, gain/duration/pan, mini control patterns, continuous control signals, named curves, and per-note lanes such as `0'gain:.8'cutoff:900` |
 | Voices | Polyphony and voice stealing, `mono`, `glide`, `unison`, `detune`, `spread`, `curve`, `blend`, `octaves`, `humanize`, `voices`, explicit `slide` controls |
 
 The pattern engine is also available directly through `rondorust::pattern`.
@@ -221,15 +221,13 @@ fractions, and random sequences use a Rust implementation with different seeds.
 The following are not implemented in this version:
 
 - JavaScript/TypeScript escapes, browser/editor UI, visual rendering, MIDI I/O,
-  neural `sing`/`ddsp`, and microphone input.
-- `zonedef` multisampling and upstream's extended wavetable presets and
-  warping (`warp`/`warpamt`). Native wavetables support `basic` and `wavedef`.
-- `voicing`, `voicelead`, `invert`, `slur`, and `chunk` modifiers, plus the
-  `overchord:` control.
+  and microphone input. Neural model runtimes are supplied by the host through
+  `DdspFactory` and `SingingRenderer`; no model weights or inference runtime
+  are bundled.
 - Pattern-valued arguments to most modifier lines. Mini-notation speed and
   Euclidean arguments may be patterned; the corresponding modifier lines take
   scalar arguments. Nested `every`, and `every` around parallel modifiers such
-  as `off`, are unsupported.
+  as `off`, and `every` around `overchord:`, are unsupported.
 - Runtime edits to a pre-rendered Bevy asset. Use the native stream API for
   mutable synthesis, or render a new asset.
 
@@ -241,8 +239,7 @@ Numeric degree patterns require a scale; include a note name in the pattern to
 use absolute MIDI pitches. Samples come from the host's `SampleBank`; no network
 sample fetching or upstream demo sample pack is bundled.
 
-Some accepted features have narrower or different behavior: `arp` splits named
-chord atoms, while comma-stacked notes keep their independent events. Discrete
+Some accepted features have narrower or different behavior: discrete
 control patterns are sampled at note onsets and do not subdivide sustained
 notes into finer control events. Native unison gain is normalized by
 `1/sqrt(N)`; upstream sums the members without that normalization. Voice
@@ -251,22 +248,29 @@ curves, play `cycles:`, and looper `name:` carry host/editor metadata; native
 parameter bounds still clamp values and render duration comes from
 `RenderOptions`. Language limits include notes in -256..256, 64 voices per
 synth, 16 unison members, and pattern grids/counts up to 4096. Resource limits
-reject some scores that upstream accepts; render limits are listed below.
+reject some scores that upstream accepts; render limits are listed below. Custom wavetable banks have a conservative
+64 MiB compile-time storage limit; offline PCM and generated vocal PCM each
+have a 256 MiB limit. Use streaming for long multichannel output.
 
 ### Reproducible compatibility audit
 
 The pinned upstream language surface is classified in
 [`tests/compatibility.rs`](tests/compatibility.rs):
 
-| Surface | Native fixtures | Explicit remaining gaps |
+| Surface | Supported fixtures | Explicit remaining gaps |
 | --- | --- | --- |
-| DSP builtins | 63 of 65 | `mic`, `ddsp` |
-| Named DSP options | 115 of 135 | 18 options on `mic`/`ddsp`; `wavetable` `warp`/`warpamt` |
-| Block directives | 19 of 26 | `sing`, `out`, `zonedef`, `visual`, `mask`, `draw`, `js` |
-| Modifiers, normalized across aliases | 42 of 47 | `chunk`, `invert`, `slur`, `voicelead`, `voicing` |
+| DSP builtins | 64 of 65 (63 core, 1 host adapter) | `mic` |
+| Named DSP options | 134 of 135 (117 core, 17 host adapter) | `mic` `device` |
+| Block directives | 22 of 26 (21 core, 1 host adapter) | `visual`, `mask`, `draw`, `js` |
+| Modifiers, normalized across aliases | 47 of 47 | None |
 | Voice flags/options | 10 of 10 | None |
 | Registered continuous control signals | 12 of 12 | None |
 | Scale families / short aliases / chord qualities | 16 / 7 / 44 | None |
+
+`ddsp` fixtures use a host adapter; `sing` fixtures use host-baked PCM. Their
+coverage proves parsing, scheduling, resource handling and control wiring,
+with no claim about neural model quality. JS, visual and microphone integrations
+remain outside the native audio scope.
 
 The tests also cover special expressions, DSP enum values, the upstream
 23-case notation gauntlet, malformed arguments, timing, pitch, and selected
@@ -309,6 +313,62 @@ the name used in `convolve room`; prepare IRs at the render sample rate.
 Convolution normalizes IR energy, uses 128-frame partitions with 127 frames of
 latency, and truncates IRs to four seconds. The same bank can be set on
 `RondocodePlugin::render_options` for loaded Bevy scores.
+
+## Multisampling, routing and neural resources
+
+`zonedef` maps inclusive note ranges to sample families and recording roots:
+
+```rondo
+zonedef piano
+  c2..b3 piano_low root:c3
+  c4..b5 piano_high root:c5
+synth keys
+  sample piano
+play keys
+  c3 c4 c5
+```
+
+Supply `piano_low`, `piano_high`, and optional `name:1` variants in `SampleBank`.
+Zone selection and variant selection latch on each gate edge; the selected
+recording root controls resampling. Uncovered notes are silent. Overlapping
+zones choose the first matching row.
+
+`out keys 3..4` sends that strip to output channels 3 and 4; `out keys 5` sums
+both stereo legs into channel 5. Channels are numbered 1–32. `Song::render`
+returns interleaved PCM with `AudioBuffer::channels()` channels, and `write_wav`
+and the Bevy decoder preserve that count. Extra feeds bypass the master gain,
+stereo processing and compressor; bus sends still feed the master pair.
+`AudioStream::next_frame(&mut buffer)` fills a complete routed frame without
+allocating; size the buffer to `stream.channels()`. The stereo iterator folds
+extra feeds into the master pair when used by a two-channel host.
+
+Register a per-instrument `Arc<dyn DdspFactory>` with
+`RenderOptions.resources.insert_ddsp("violin", factory)` to render `ddsp violin`.
+The factory receives the fixed settings and sample rate, reports per-voice
+storage, and creates independent `DdspVoice` instances before playback. Each
+voice receives gate, pitch, velocity and all eight expressive inputs, including
+`vel`, at audio rate. Its `process` and `reset` methods must not allocate or
+block. Native voice pitch includes unison, humanization and mono glide.
+
+Register an `Arc<dyn SingingRenderer>` with `resources.set_singing(renderer)`
+for vocal blocks:
+
+```rondo
+sing vocal voice:alto
+  hello world
+  c4 d4
+  cycles: 2
+  gain: .7
+  post
+    reverb mix:.2
+```
+
+The host receives joined lyric/melody notation, voice, tempo, phrase cycles and
+sample rate, and returns one baked mono `Sample`. Baking happens once before
+streaming; phrase triggers repeat every `cycles:` bars, with native modifiers,
+section arrangement and post effects. `Song::singing_requests()` exposes the
+requests. Pre-baked PCM inserted under `request.sample_name()` bypasses baking.
+Missing model adapters or phrase samples return explicit resource errors.
 
 ## Stream native synthesis
 

@@ -8,7 +8,7 @@ use std::{
     process::ExitCode,
 };
 
-const HELP: &str = "Render a rondocode file to a 16-bit stereo WAV.
+const HELP: &str = "Render a rondocode file to a 16-bit PCM WAV.
 
 Usage: rondorust <INPUT> [OUTPUT] [OPTIONS]
 
@@ -138,10 +138,11 @@ fn render(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     write_wav(&mut writer, &audio)?;
     writer.flush()?;
     println!(
-        "Wrote {}: {:.2}s, {} Hz, stereo, peak {:.3}, RMS {:.3}",
+        "Wrote {}: {:.2}s, {} Hz, {} channels, peak {:.3}, RMS {:.3}",
         command.output.display(),
         audio.duration().as_secs_f64(),
         audio.sample_rate(),
+        audio.channels(),
         audio.peak(),
         audio.rms(),
     );

@@ -1,4 +1,4 @@
-//! Parse rondocode's rondo language and synthesize stereo audio in native Rust.
+//! Parse rondocode's rondo language and synthesize multichannel audio in native Rust.
 //!
 //! The default build has no dependencies or audio-device requirement. Enable
 //! `bevy` for `RondocodePlugin` and custom assets.
@@ -21,9 +21,11 @@ mod language;
 pub mod pattern;
 mod pitch;
 mod render;
+mod resources;
 mod sample;
 mod song;
 mod wav;
+mod wavetable;
 
 #[cfg(feature = "bevy")]
 pub mod bevy;
@@ -31,6 +33,9 @@ pub mod bevy;
 pub use error::{Diagnostic, Error, Result};
 pub use pitch::{Scale, midi_to_frequency, note_to_midi};
 pub use render::{AudioBuffer, AudioStream, RenderOptions};
+pub use resources::{
+    DdspFactory, DdspFrame, DdspSettings, DdspVoice, HostResources, SingingRenderer, SingingRequest,
+};
 pub use sample::{Sample, SampleBank};
 pub use song::{NoteEvent, Song};
 pub use wav::write_wav;

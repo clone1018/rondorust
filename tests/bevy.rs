@@ -109,3 +109,27 @@ fn asset_server_loads_and_renders_rondo_files() {
     assert_eq!(audio.frames(), 16000);
     assert!(audio.rms() > 0.005);
 }
+
+#[test]
+fn routed_decoders_preserve_channel_count_duration_and_seeking() {
+    let source = RondocodeAudioSource::from_rondo(
+        "cps 1\nout x 3..4\nsynth x\n  sine\nplay x\n  a4",
+        RenderOptions {
+            sample_rate: 8000,
+            cycles: 1.,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut decoder = source.decoder();
+    assert_eq!(decoder.channels().get(), 4);
+    assert_eq!(decoder.len(), 32000);
+    assert_eq!(decoder.total_duration().unwrap().as_secs_f64(), 1.);
+    decoder
+        .try_seek(std::time::Duration::from_millis(500))
+        .unwrap();
+    assert_eq!(decoder.len(), 16000);
+    assert_eq!(decoder.next(), Some(0.));
+    assert_eq!(decoder.next(), Some(0.));
+    assert!(decoder.next().is_some());
+}

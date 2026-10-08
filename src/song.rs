@@ -49,6 +49,8 @@ pub(crate) struct SongData {
     pub sidechain: Option<Sidechain>,
     pub width: f64,
     pub mono_below: f64,
+    pub outputs: Vec<(usize, usize)>,
+    pub singing: Vec<crate::SingingRequest>,
 }
 /// A parsed and compiled rondo score. Clones share immutable signal graphs.
 #[derive(Clone, Debug)]
@@ -79,15 +81,29 @@ struct Channel {
     beat: bool,
     absolute: bool,
     scale: Option<Pattern>,
+    overchord: Option<Pattern>,
+    scale_clock: Vec<usize>,
+    overchord_clock: Vec<usize>,
+    windows: Vec<(usize, bool, Vec<usize>)>,
     controls: Vec<Control>,
     transforms: Vec<NoteTransform>,
     region: Option<(f64, f64, f64)>,
+}
+#[derive(Clone, Debug)]
+struct ResolvedNote {
+    event: NoteEvent,
+    whole: crate::pattern::TimeSpan,
+    degree: Option<f64>,
+    scale: Option<String>,
+    accidental: f64,
+    explicit_slide: bool,
 }
 #[derive(Clone, Debug)]
 struct Control {
     name: String,
     lane: Lane,
     every: Option<usize>,
+    clock: Vec<usize>,
 }
 #[derive(Clone, Debug)]
 enum Lane {
@@ -108,7 +124,11 @@ enum NoteTransform {
     Octave(f64),
     Echo(usize, f64, f64, bool),
     Arp(String),
-    Every(usize, Box<NoteTransform>),
+    Invert(i32),
+    Voicing(String),
+    Voicelead(f64),
+    Slur(f64, u64),
+    Every(usize, Box<NoteTransform>, Vec<usize>),
 }
 
 impl Song {
@@ -128,6 +148,7 @@ impl Song {
         let mut width = 1.;
         let mut mono_below = 0.;
         let mut song_order = None;
+        let mut routes = BTreeMap::new();
         for line in &program.directives {
             let fields: Vec<_> = line.text.split_whitespace().collect();
             let rest = fields
@@ -135,6 +156,21 @@ impl Song {
                 .copied()
                 .ok_or_else(|| line.error("directive needs a value"))?;
             match fields[0] {
+                "out" => {
+                    exact_count(&fields, 3, line)?;
+                    let (lo, hi) = fields[2].split_once("..").unwrap_or((fields[2], fields[2]));
+                    let (lo, hi) = (language::number(lo, line)?, language::number(hi, line)?);
+                    if lo.fract() != 0.
+                        || hi.fract() != 0.
+                        || lo < 1.
+                        || hi < lo
+                        || hi > lo + 1.
+                        || hi > 32.
+                    {
+                        return Err(line.error("out takes a channel or adjacent pair in 1..32"));
+                    }
+                    routes.insert(fields[1].to_owned(), (lo as usize - 1, hi as usize - 1));
+                }
                 "cps" => {
                     exact_count(&fields, 2, line)?;
                     cps = language::number(rest, line)?;
@@ -294,17 +330,30 @@ impl Song {
                 return Err(Error::invalid("bpm at this meter must give cps in .05..4"));
             }
         }
+        let table_bytes: usize = waves
+            .values()
+            .map(|frames| frames.len() * 11 * 2048 * 8)
+            .sum();
+        if table_bytes > 64 * 1024 * 1024 {
+            return Err(Error::invalid(
+                "custom wavetables exceed 64 MiB of estimated table storage",
+            ));
+        }
+        let waves: BTreeMap<_, _> = waves
+            .into_iter()
+            .map(|(name, spectra)| (name, crate::wavetable::TableBank::new(&spectra)))
+            .collect();
         let mut synths = Vec::new();
         let mut names = BTreeMap::new();
         for s in &program.synths {
             if names.insert(s.name.clone(), synths.len()).is_some() {
                 return Err(Error::invalid(format!("duplicate synth `{}`", s.name)));
             }
-            let graph = dsp::compile(&s.chain, &macros, &waves)?;
+            let graph = dsp::compile(&s.chain, &macros, &waves, &program.zones)?;
             let post = s
                 .post
                 .as_ref()
-                .map(|p| dsp::compile(p, &macros, &waves))
+                .map(|p| dsp::compile(p, &macros, &waves, &program.zones))
                 .transpose()?;
             let voices = *s.options.get("voices").unwrap_or(&12.);
             let unison = *s.options.get("unison").unwrap_or(&1.);
@@ -367,7 +416,7 @@ impl Song {
             if !bus_names.insert(&bus.name) || names.contains_key(&bus.name) {
                 return Err(Error::invalid("bus names must be unique"));
             }
-            let graph = dsp::compile(&bus.chain, &macros, &waves)?;
+            let graph = dsp::compile(&bus.chain, &macros, &waves, &program.zones)?;
             let sends = bus
                 .sends
                 .iter()
@@ -475,6 +524,17 @@ impl Song {
         if channels.len() > 1024 {
             return Err(Error::invalid("score has too many pattern channels"));
         }
+        for name in routes.keys() {
+            if !synths.iter().any(|s| s.name == *name) {
+                return Err(Error::invalid(format!(
+                    "out references unknown synth `{name}`"
+                )));
+            }
+        }
+        let outputs = synths
+            .iter()
+            .map(|s| routes.get(&s.name).copied().unwrap_or((0, 1)))
+            .collect();
         Ok(Self {
             data: Arc::new(SongData {
                 synths,
@@ -485,6 +545,15 @@ impl Song {
                 sidechain,
                 width,
                 mono_below,
+                outputs,
+                singing: program
+                    .singing
+                    .into_iter()
+                    .map(|mut r| {
+                        r.cps = cps;
+                        r
+                    })
+                    .collect(),
             }),
             channels,
             scales,
@@ -496,6 +565,11 @@ impl Song {
     }
     pub fn time_signature(&self) -> (u32, u32) {
         self.meter
+    }
+    /// Vocal requests, with score tempo and phrase lengths. Sample rate is set
+    /// to the requested render rate when the host renderer is called.
+    pub fn singing_requests(&self) -> &[crate::SingingRequest] {
+        &self.data.singing
     }
     pub fn synth_names(&self) -> impl Iterator<Item = &str> {
         self.data.synths.iter().map(|s| s.name.as_str())
@@ -547,9 +621,28 @@ impl Song {
         offset: f64,
         events: &mut Vec<NoteEvent>,
     ) -> Result<()> {
-        for hap in channel.pattern.query(begin, end)? {
+        let neighbors = channel.transforms.iter().any(|t| {
+            matches!(
+                t,
+                NoteTransform::Voicelead(_)
+                    | NoteTransform::Slur(_, _)
+                    | NoteTransform::Every(_, _, _)
+            )
+        });
+        let query_begin = if neighbors { begin - 4. } else { begin };
+        let mut haps = channel
+            .pattern
+            .query(query_begin, if neighbors { end + 1. } else { end })?;
+        if neighbors {
+            let edge = haps.iter().map(|h| h.whole.end).fold(end, f64::max);
+            if edge >= end + 1. {
+                haps.extend(channel.pattern.query(edge, edge + 1e-7)?);
+            }
+        }
+        let mut resolved = Vec::new();
+        for hap in haps {
             let onset = hap.whole.begin;
-            if onset < begin - 1e-10 || onset >= end - 1e-10 || onset < hap.part.begin - 1e-10 {
+            if onset < query_begin - 1e-10 || onset < hap.part.begin - 1e-10 {
                 continue;
             }
             let mut gain = 1.;
@@ -559,17 +652,19 @@ impl Song {
             let mut params = BTreeMap::new();
             let mut slice = (0., 1.);
             let mut slide = false;
+            let mut explicit_slide = false;
             let mut scale_name = channel
                 .scale
                 .as_ref()
-                .map(|p| p.value_at(onset))
+                .map(|p| p.value_at(clock_time(onset, &channel.scale_clock)))
                 .transpose()?
                 .flatten()
                 .map(|v| v.text());
             for control in &channel.controls {
+                let control_onset = clock_time(onset, &control.clock);
                 if control
                     .every
-                    .is_some_and(|n| (onset.floor() as i64).rem_euclid(n as i64) != 0)
+                    .is_some_and(|n| (control_onset.floor() as i64).rem_euclid(n as i64) != 0)
                 {
                     continue;
                 }
@@ -578,7 +673,7 @@ impl Song {
                 } else {
                     onset
                 };
-                let value = control.lane.at(sample_time)?;
+                let value = control.lane.at(clock_time(sample_time, &control.clock))?;
                 let Some(value) = value else {
                     continue;
                 };
@@ -605,7 +700,10 @@ impl Song {
                     "pan" => pan = n.clamp(0., 1.),
                     "begin" => slice.0 = n.clamp(0., 1.),
                     "end" => slice.1 = n.clamp(0., 1.),
-                    "slide" => slide = n > 0.,
+                    "slide" => {
+                        slide = n > 0.;
+                        explicit_slide = true;
+                    }
                     _ => {
                         params.insert(control.name.clone(), n);
                     }
@@ -646,7 +744,10 @@ impl Song {
                         "pan" => pan = val.clamp(0., 1.),
                         "begin" => slice.0 = val.clamp(0., 1.),
                         "end" => slice.1 = val.clamp(0., 1.),
-                        "slide" => slide = val > 0.,
+                        "slide" => {
+                            slide = val > 0.;
+                            explicit_slide = true;
+                        }
                         "chance" => {
                             if time_hash(onset, 0) >= val {
                                 pitch.clear();
@@ -684,7 +785,7 @@ impl Song {
             }
             let mut degree = None;
             let mut accidental = 0.;
-            let mut notes = if channel.beat {
+            let notes = if channel.beat {
                 vec![60.]
             } else if text
                 .chars()
@@ -702,7 +803,27 @@ impl Song {
                 let n = bare
                     .parse::<f64>()
                     .map_err(|_| Error::invalid(format!("invalid note `{text}`")))?;
-                if channel.absolute {
+                if !n.is_finite() {
+                    return Err(Error::invalid("note must be finite"));
+                }
+                if let Some(chords) = &channel.overchord {
+                    let mut chord = Vec::new();
+                    let chord_time = clock_time(onset, &channel.overchord_clock);
+                    for h in chords.query(chord_time, chord_time + 1e-7)? {
+                        chord.extend(chord_notes(&h.value.text())?);
+                    }
+                    chord.sort_by(f64::total_cmp);
+                    chord.dedup();
+                    if chord.is_empty() {
+                        continue;
+                    }
+                    let d = (n + 0.5).floor() as i64;
+                    vec![
+                        chord[d.rem_euclid(chord.len() as i64) as usize]
+                            + 12. * d.div_euclid(chord.len() as i64) as f64
+                            + accidental,
+                    ]
+                } else if channel.absolute {
                     vec![n]
                 } else {
                     degree = Some(n);
@@ -711,50 +832,6 @@ impl Song {
                     vec![tuning.degree(n.round(), root) + accidental]
                 }
             };
-            let mut time = onset;
-            let mut echoes = Vec::new();
-            let mut arp = None;
-            for transform in &channel.transforms {
-                let transform = if let NoteTransform::Every(n, transform) = transform {
-                    if (onset.floor() as i64).rem_euclid(*n as i64) != 0 {
-                        continue;
-                    }
-                    transform.as_ref()
-                } else {
-                    transform
-                };
-                match transform {
-                    NoteTransform::Add(n) => {
-                        if let (Some(deg), Some(scale)) = (degree, scale_name.as_ref()) {
-                            let (root, tuning) = self.resolve_scale(scale)?;
-                            let octave_offset =
-                                notes[0] - tuning.degree(deg.round(), root) - accidental;
-                            degree = Some(deg + n);
-                            notes[0] =
-                                tuning.degree((deg + n).round(), root) + accidental + octave_offset;
-                        } else {
-                            for note in &mut notes {
-                                *note += n;
-                            }
-                        }
-                    }
-                    NoteTransform::Octave(n) => {
-                        for note in &mut notes {
-                            *note += 12. * n;
-                        }
-                    }
-                    NoteTransform::Echo(count, delay, decay, ping) => {
-                        for n in 1..*count {
-                            let tap_pan = ping.then_some(if n % 2 == 1 { 0.85 } else { 0.15 });
-                            echoes.push((n as f64 * delay, decay.powi(n as i32), tap_pan));
-                        }
-                    }
-                    NoteTransform::Arp(mode) => arp = Some(mode.as_str()),
-                    NoteTransform::Every(_, _) => {
-                        unreachable!("nested every is rejected by the parser")
-                    }
-                }
-            }
             let push = params.remove("__push").unwrap_or(0.);
             let definition = self.data.synths.iter().find(|s| s.name == synth).unwrap();
             for name in params.keys() {
@@ -769,28 +846,17 @@ impl Song {
                     )));
                 }
             }
-            time += push * (hap.whole.end - onset);
-            if let Some(mode) = arp {
-                notes = arp_notes(notes, mode)?;
-            }
-            let note_count = notes.len();
-            for (index, note) in notes.into_iter().enumerate() {
-                if !note.is_finite() || !(-256.0..=256.).contains(&note) {
-                    return Err(Error::invalid("note must be finite and in -256..256"));
-                }
-                let note_start = if arp.is_some() {
-                    time + index as f64 * (hap.whole.end - onset) / note_count as f64
-                } else {
-                    time
-                };
-                let length = (hap.whole.end - onset) * dur
-                    / if arp.is_some() { note_count as f64 } else { 1. };
-                let duration = (length / self.data.cps - 0.005).max(0.005);
-                if note_start >= 0. && note_start < end {
-                    events.push(NoteEvent {
+            for note in notes {
+                resolved.push(ResolvedNote {
+                    whole: hap.whole,
+                    degree,
+                    scale: scale_name.clone(),
+                    accidental,
+                    explicit_slide,
+                    event: NoteEvent {
                         synth: synth.clone(),
-                        time: (note_start + offset) / self.data.cps,
-                        duration,
+                        time: onset + push * (hap.whole.end - onset),
+                        duration: (hap.whole.end - onset) * dur,
                         note,
                         gain,
                         pan,
@@ -798,29 +864,222 @@ impl Song {
                         begin: slice.0,
                         end: slice.1,
                         slide,
-                    });
-                }
-                for &(delay, mult, tap_pan) in &echoes {
-                    let at = note_start + delay;
-                    if at < end && at >= 0. {
-                        events.push(NoteEvent {
-                            synth: synth.clone(),
-                            time: (at + offset) / self.data.cps,
-                            duration,
-                            note,
-                            gain: gain * mult,
-                            pan: tap_pan.unwrap_or(pan),
-                            params: params.clone(),
-                            begin: slice.0,
-                            end: slice.1,
-                            slide: false,
-                        });
+                    },
+                });
+            }
+            if resolved.len() > 100_000 {
+                return Err(Error::invalid("score exceeds 100000 scheduled notes"));
+            }
+        }
+        for transform in &channel.transforms {
+            self.transform_notes(&mut resolved, transform, None)?;
+        }
+        for mut resolved in resolved {
+            if !channel.windows.iter().all(|(count, inside, clock)| {
+                let time = clock_time(resolved.whole.begin, clock);
+                let index = (time.floor() as i64).rem_euclid(*count as i64) as usize;
+                let position = time.rem_euclid(1.);
+                (position >= index as f64 / *count as f64
+                    && position < (index + 1) as f64 / *count as f64)
+                    == *inside
+            }) {
+                continue;
+            }
+            let event = &mut resolved.event;
+            if !event.note.is_finite() || !(-256.0..=256.).contains(&event.note) {
+                return Err(Error::invalid("note must be finite and in -256..256"));
+            }
+            if event.time >= begin && event.time < end {
+                event.time = (event.time + offset) / self.data.cps;
+                event.duration = (event.duration / self.data.cps - 0.005).max(0.005);
+                events.push(resolved.event);
+            }
+        }
+        if events.len() > 100_000 {
+            return Err(Error::invalid("score exceeds 100000 scheduled notes"));
+        }
+        Ok(())
+    }
+    fn transform_notes(
+        &self,
+        notes: &mut Vec<ResolvedNote>,
+        transform: &NoteTransform,
+        every: Option<(usize, &[usize])>,
+    ) -> Result<()> {
+        if let NoteTransform::Every(n, inner, clock) = transform {
+            return self.transform_notes(notes, inner, Some((*n, clock)));
+        }
+        let selected = |n: &ResolvedNote| {
+            every.is_none_or(|(period, clock)| {
+                (clock_time(n.whole.begin, clock).floor() as i64).rem_euclid(period as i64) == 0
+            })
+        };
+        match transform {
+            NoteTransform::Add(amount) | NoteTransform::Octave(amount) => {
+                for n in notes.iter_mut().filter(|n| selected(n)) {
+                    if matches!(transform, NoteTransform::Octave(_)) {
+                        n.event.note += amount * 12.;
+                    } else if let (Some(degree), Some(scale)) = (n.degree, n.scale.as_ref()) {
+                        let (root, tuning) = self.resolve_scale(scale)?;
+                        let offset =
+                            n.event.note - tuning.degree(degree.round(), root) - n.accidental;
+                        n.degree = Some(degree + amount);
+                        n.event.note =
+                            tuning.degree((degree + amount).round(), root) + n.accidental + offset;
+                    } else {
+                        n.event.note += amount;
                     }
                 }
-                if events.len() > 100_000 {
-                    return Err(Error::invalid("score exceeds 100000 scheduled notes"));
+            }
+            NoteTransform::Echo(count, delay, decay, ping) => {
+                let source = notes.clone();
+                for n in source.into_iter().filter(selected) {
+                    for tap in 1..*count {
+                        let mut echo = n.clone();
+                        echo.event.time += tap as f64 * delay;
+                        echo.whole.begin += tap as f64 * delay;
+                        echo.whole.end += tap as f64 * delay;
+                        echo.event.gain *= decay.powi(tap as i32);
+                        echo.event.slide = false;
+                        if *ping {
+                            echo.event.pan = if tap % 2 == 1 { 0.85 } else { 0.15 };
+                        }
+                        notes.push(echo);
+                        if notes.len() > 100_000 {
+                            return Err(Error::invalid("score exceeds 100000 scheduled notes"));
+                        }
+                    }
                 }
             }
+            NoteTransform::Slur(probability, seed) => {
+                let mut source = notes.clone();
+                source.sort_by(|a, b| a.whole.begin.total_cmp(&b.whole.begin));
+                for n in notes
+                    .iter_mut()
+                    .filter(|n| selected(n) && !n.explicit_slide)
+                {
+                    let lo = source.partition_point(|m| m.whole.begin < n.whole.end - 1e-9);
+                    let hi = source.partition_point(|m| m.whole.begin <= n.whole.end + 1e-9);
+                    let next = &source[lo..hi];
+                    n.event.slide = !next.is_empty()
+                        && next.iter().all(|m| m.event.note != n.event.note)
+                        && time_hash(n.whole.end, *seed) < *probability;
+                }
+            }
+            NoteTransform::Invert(_)
+            | NoteTransform::Voicing(_)
+            | NoteTransform::Voicelead(_)
+            | NoteTransform::Arp(_) => {
+                notes.sort_by(|a, b| {
+                    a.whole
+                        .begin
+                        .total_cmp(&b.whole.begin)
+                        .then(a.whole.end.total_cmp(&b.whole.end))
+                        .then(a.event.note.total_cmp(&b.event.note))
+                });
+                let source = notes.clone();
+                let mut output = Vec::new();
+                let mut at = 0;
+                while at < source.len() {
+                    let first = &source[at];
+                    let mut end = at + 1;
+                    while end < source.len() && source[end].whole == first.whole {
+                        end += 1;
+                    }
+                    let group = &source[at..end];
+                    if !selected(first) {
+                        output.extend_from_slice(group);
+                        at = end;
+                        continue;
+                    }
+                    if let NoteTransform::Arp(mode) = transform {
+                        let pitches =
+                            arp_notes(group.iter().map(|n| n.event.note).collect(), mode)?;
+                        for (i, pitch) in pitches.iter().enumerate() {
+                            let mut n = group
+                                .iter()
+                                .find(|n| n.event.note == *pitch)
+                                .unwrap()
+                                .clone();
+                            let size = (first.whole.end - first.whole.begin) / pitches.len() as f64;
+                            n.event.note = *pitch;
+                            n.degree = None;
+                            n.event.time = first.event.time + i as f64 * size;
+                            n.event.duration /= pitches.len() as f64;
+                            n.whole.begin = first.whole.begin + i as f64 * size;
+                            n.whole.end = n.whole.begin + size;
+                            output.push(n);
+                        }
+                    } else {
+                        let previous_end = source[..at]
+                            .partition_point(|n| n.whole.begin < first.whole.begin - 1e-9);
+                        let refs: Vec<_> = if previous_end > 0 {
+                            let previous = source[previous_end - 1].whole.begin;
+                            let lo = source[..previous_end]
+                                .partition_point(|n| n.whole.begin < previous);
+                            if previous >= first.whole.begin - 4. {
+                                source[lo..previous_end]
+                                    .iter()
+                                    .map(|n| n.event.note)
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        for (i, original) in group.iter().enumerate() {
+                            let mut n = original.clone();
+                            match transform {
+                                NoteTransform::Invert(k) => {
+                                    let count = group.len() as i32;
+                                    let full = k.abs() / count;
+                                    let rem = (k.abs() % count) as usize;
+                                    n.event.note += if *k >= 0 {
+                                        12. * (full + i32::from(i < rem)) as f64
+                                    } else {
+                                        -12. * (full + i32::from(i >= group.len() - rem)) as f64
+                                    };
+                                }
+                                NoteTransform::Voicing(mode) => {
+                                    n.event.note += match mode.as_str() {
+                                        "open" if i == 1 => 12.,
+                                        "spread" if i % 2 == 1 => 12.,
+                                        "drop2" if group.len() >= 2 && i == group.len() - 2 => -12.,
+                                        "drop3" if group.len() >= 3 && i == group.len() - 3 => -12.,
+                                        _ => 0.,
+                                    }
+                                }
+                                NoteTransform::Voicelead(center) => {
+                                    let refs = if refs.is_empty() {
+                                        std::slice::from_ref(center)
+                                    } else {
+                                        &refs
+                                    };
+                                    n.event.note = refs
+                                        .iter()
+                                        .map(|r| {
+                                            let pitch = original.event.note
+                                                + 12.
+                                                    * ((r - original.event.note) / 12. + 0.5)
+                                                        .floor();
+                                            (pitch, (pitch - r).abs())
+                                        })
+                                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                                        .unwrap()
+                                        .0;
+                                }
+                                _ => unreachable!(),
+                            }
+                            n.degree = None;
+                            output.push(n);
+                        }
+                    }
+                    at = end;
+                }
+                *notes = output;
+            }
+            NoteTransform::Every(_, _, _) => unreachable!(),
         }
         Ok(())
     }
@@ -971,7 +1230,7 @@ const COMBINATORS: &[&str] = &[
     "ping",
     "onsetsonly",
 ];
-fn is_modifier(line: &Line, beat: bool) -> bool {
+pub(crate) fn is_modifier(line: &Line, beat: bool) -> bool {
     let word = line.word().trim_end_matches(':').to_ascii_lowercase();
     if COMBINATORS.contains(&word.as_str()) {
         return true;
@@ -1047,6 +1306,10 @@ fn compile_play(
             beat,
             absolute,
             scale: None,
+            overchord: None,
+            scale_clock: Vec::new(),
+            overchord_clock: Vec::new(),
+            windows: Vec::new(),
             controls: Vec::new(),
             transforms: Vec::new(),
             region: None,
@@ -1055,6 +1318,20 @@ fn compile_play(
     if channels.is_empty() {
         return Err(play.header.error("play has no notation"));
     }
+    // Lines sharing a route and pitch interpretation form one stacked pattern.
+    // Chord transformations must see the complete simultaneous chord.
+    let mut stacked: Vec<Channel> = Vec::new();
+    for channel in channels {
+        if let Some(previous) = stacked
+            .iter_mut()
+            .find(|c| c.synth == channel.synth && c.absolute == channel.absolute)
+        {
+            previous.pattern = Pattern::stack(vec![previous.pattern.clone(), channel.pattern]);
+        } else {
+            stacked.push(channel);
+        }
+    }
+    let mut channels = stacked;
     for channel in &mut channels {
         channel.scale = scale.clone();
     }
@@ -1093,6 +1370,29 @@ fn irand_pattern(text: &str, line: &Line) -> Result<Pattern> {
     };
     Pattern::irand(range, steps).map_err(|e| line.error(e.to_string()))
 }
+fn clock_time(mut time: f64, clock: &[usize]) -> f64 {
+    for count in clock.iter().rev() {
+        time = (time.floor() / *count as f64).floor() + time.rem_euclid(1.);
+    }
+    time
+}
+fn reclock_channel(channel: &mut Channel, count: usize, inside: bool) {
+    channel.pattern = channel.pattern.chunk_clock(count);
+    channel.scale_clock.push(count);
+    channel.overchord_clock.push(count);
+    for control in &mut channel.controls {
+        control.clock.push(count);
+    }
+    for transform in &mut channel.transforms {
+        if let NoteTransform::Every(_, _, clock) = transform {
+            clock.push(count);
+        }
+    }
+    for (_, _, clock) in &mut channel.windows {
+        clock.push(count);
+    }
+    channel.windows.push((count, inside, Vec::new()));
+}
 fn apply_channel_modifier(
     mut channel: Channel,
     text: &str,
@@ -1107,6 +1407,30 @@ fn apply_channel_modifier(
     let (name, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
     let name = name.trim_end_matches(':').to_ascii_lowercase();
     let rest = rest.trim();
+    if name == "chunk" {
+        let (count, transform) = rest
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| line.error("chunk needs a count and transformation"))?;
+        let count = language::number(count.trim_end_matches(':'), line)?;
+        if count.fract() != 0. || !(1.0..=4096.).contains(&count) {
+            return Err(line.error("chunk count must be in 1..4096"));
+        }
+        let mut transformed = apply_channel_modifier(
+            channel.clone(),
+            transform.trim_start_matches(':').trim(),
+            line,
+            macros,
+            curves,
+            depth + 1,
+        )?;
+        reclock_channel(&mut channel, count as usize, false);
+        for c in &mut transformed {
+            reclock_channel(c, count as usize, true);
+        }
+        let mut result = vec![channel];
+        result.extend(transformed);
+        return Ok(result);
+    }
     if name == "always" {
         return apply_channel_modifier(
             channel,
@@ -1163,12 +1487,14 @@ fn apply_channel_modifier(
                 name: "pan".into(),
                 lane: Lane::Constant(0.5 - amount * 0.5),
                 every: None,
+                clock: Vec::new(),
             });
             for channel in &mut transformed {
                 channel.controls.push(Control {
                     name: "pan".into(),
                     lane: Lane::Constant(0.5 + amount * 0.5),
                     every: None,
+                    clock: Vec::new(),
                 });
             }
         }
@@ -1244,7 +1570,12 @@ fn apply_modifier(
         && !COMBINATORS.contains(&key.to_ascii_lowercase().as_str())
     {
         if key == "overchord" {
-            return Err(line.error("overchord is not implemented in this native port"));
+            if every.is_some() {
+                return Err(line.error("every around overchord is not supported"));
+            }
+            channel.overchord = Some(Pattern::parse(value.trim())?);
+            channel.overchord_clock.clear();
+            return Ok(());
         }
         if key == "cycles" {
             let cycles = language::number(value.trim(), line)?;
@@ -1256,6 +1587,7 @@ fn apply_modifier(
             return Ok(());
         }
         channel.controls.push(Control {
+            clock: Vec::new(),
             name: key.into(),
             lane: Lane::parse(value.trim(), line, macros, curves)?,
             every,
@@ -1275,7 +1607,8 @@ fn apply_modifier(
         | "striate" | "linger" | "degradeby" | "undegradeby" | "add" | "sub" | "mul" | "div"
         | "octave" => Some((1, 1)),
         "roll" | "swingby" => Some((1, 2)),
-        "swing" | "arp" => Some((0, 1)),
+        "swing" | "arp" | "invert" | "voicelead" | "voicing" => Some((0, 1)),
+        "slur" => Some((0, 2)),
         "euclid" | "euclidinv" | "echo" | "ping" | "humanizeby" => Some((2, 3)),
         _ => None,
     };
@@ -1320,7 +1653,7 @@ fn apply_modifier(
                 .transforms
                 .into_iter()
                 .skip(previous_transforms)
-                .map(|t| NoteTransform::Every(n as usize, Box::new(t))),
+                .map(|t| NoteTransform::Every(n as usize, Box::new(t), Vec::new())),
         );
         channel.pattern = channel.pattern.every(n as usize, other.pattern)?;
         channel
@@ -1330,6 +1663,7 @@ fn apply_modifier(
     }
     match name.as_str() {
         "gain" | "dur" | "pan" => channel.controls.push(Control {
+            clock: Vec::new(),
             name,
             lane: Lane::parse(rest, line, macros, curves)?,
             every,
@@ -1454,6 +1788,38 @@ fn apply_modifier(
                 decay,
                 name == "ping",
             ));
+        }
+        "invert" => {
+            let n = num(0, Some(1.))?;
+            if n.abs() > 4096. {
+                return Err(line.error("invert must be in -4096..4096"));
+            }
+            channel
+                .transforms
+                .push(NoteTransform::Invert(n.trunc() as i32));
+        }
+        "voicing" => {
+            let rest = if rest.is_empty() { "close" } else { rest };
+            if !matches!(rest, "close" | "open" | "drop2" | "drop3" | "spread") {
+                return Err(line.error("unknown voicing"));
+            }
+            channel.transforms.push(NoteTransform::Voicing(rest.into()));
+        }
+        "voicelead" => channel
+            .transforms
+            .push(NoteTransform::Voicelead(num(0, Some(60.))?)),
+        "slur" => {
+            let probability = num(0, Some(0.8))?;
+            if !(0.0..=1.).contains(&probability) {
+                return Err(line.error("slur probability must be in 0..1"));
+            }
+            let seed = num(1, Some(71.))?;
+            if seed.fract() != 0. || !(0.0..=u32::MAX as f64).contains(&seed) {
+                return Err(line.error("slur seed must be an integer in 0..4294967295"));
+            }
+            channel
+                .transforms
+                .push(NoteTransform::Slur(probability, seed as u64));
         }
         "arp" => {
             let mode = if rest.is_empty() { "up" } else { rest };
