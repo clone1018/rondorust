@@ -111,6 +111,225 @@ fn determinism_and_stream_offline_agreement() {
     assert_eq!(a.samples(), stream);
 }
 #[test]
+fn irand_notation_schedules_scaled_steps_and_accepts_modifiers() {
+    let score = "cps 1\nsynth x\n  sine\n  * gate\n  * .1\nplay x\n  irand 5";
+    let song = Song::parse(&format!("{score}\n  scale: a-min")).unwrap();
+    let events = song.events(4.).unwrap();
+    assert_eq!(events.len(), 32);
+    assert_eq!(events, song.events(4.).unwrap());
+    assert_eq!(song.events(1.).unwrap(), events[..8]);
+    for (step, event) in events.iter().enumerate() {
+        assert_eq!(event.time, step as f64 / 8.);
+        assert!([57., 59., 60., 62., 64.].contains(&event.note));
+    }
+    assert!(events.windows(2).any(|pair| pair[0].note != pair[1].note));
+    let song = Song::parse(&format!(
+        "{score} seg:16 scale:c-maj\n  fast 2\n  gain: .4\n  dur: .5"
+    ))
+    .unwrap();
+    let events = song.events(1.).unwrap();
+    assert_eq!(events.len(), 32);
+    for (step, event) in events.iter().enumerate() {
+        assert_eq!(event.time, step as f64 / 32.);
+        assert_eq!(event.gain, 0.4);
+        assert!((event.duration - (1. / 64. - 0.005)).abs() < 1e-12);
+    }
+    assert!(song.render(options()).unwrap().rms() > 0.01);
+    let constant = Song::parse(&format!(
+        "{}\n  scale: a-min",
+        score.replace("irand 5", "irand 1 seg:3")
+    ))
+    .unwrap()
+    .events(1.)
+    .unwrap();
+    assert_eq!(constant.iter().filter(|event| event.note == 57.).count(), 3);
+}
+
+#[test]
+fn irand_errors_point_to_the_notation_line() {
+    for notation in [
+        "irand",
+        "irand eight",
+        "irand 2.5",
+        "irand -1",
+        "irand 0",
+        "irand 5 seg:0",
+        "irand 5 seg:4097",
+        "irand 5 seg:2.5",
+        "irand 5 extra",
+        "irand 5 seg:8 extra",
+        "irand 99999999999999999999999",
+    ] {
+        let error = Song::parse(&format!("synth x\n  sine\nplay x\n  {notation}")).unwrap_err();
+        let Error::Parse(diagnostic) = error else {
+            panic!("{notation}: {error}")
+        };
+        assert_eq!((diagnostic.line, diagnostic.column), (4, 3), "{notation}");
+    }
+    let error = Song::parse("beat\n  irand 4").unwrap_err();
+    assert!(error.to_string().contains("2:3:"));
+    assert!(error.to_string().contains("belongs in a `play` block"));
+}
+
+#[test]
+fn humanize_is_deterministic_and_zero_preserves_audio() {
+    for voices in ["", "unison:5 detune:0 spread:0", "mono glide:.05"] {
+        let score = |humanize: &str| {
+            format!(
+                "cps 1\nsynth x {voices} {humanize}\n  sine\n  * adsr .001 .01 .8 .01\n  * .1\nplay x\n  [c4 e4 g4] c5"
+            )
+        };
+        let plain = Song::parse(&score("")).unwrap().render(options()).unwrap();
+        let zero = Song::parse(&score("humanize:0"))
+            .unwrap()
+            .render(options())
+            .unwrap();
+        assert_eq!(plain.samples(), zero.samples(), "{voices}");
+        let song = Song::parse(&score("humanize:.7")).unwrap();
+        let first = song.render(options()).unwrap();
+        let second = Song::parse(&score("humanize:.7"))
+            .unwrap()
+            .render(options())
+            .unwrap();
+        assert_eq!(first.samples(), second.samples(), "{voices}");
+        assert_ne!(plain.samples(), first.samples(), "{voices}");
+        assert_eq!(
+            first.samples(),
+            song.stream(options())
+                .unwrap()
+                .flatten()
+                .collect::<Vec<_>>()
+        );
+    }
+    for value in ["-.1", "1.1", "NaN", "inf"] {
+        assert!(Song::parse(&format!("synth x humanize:{value}\n  sine")).is_err());
+    }
+}
+
+#[test]
+fn humanize_pitch_and_delay_stay_within_upstream_bounds() {
+    fn frequency(samples: &[f32], sr: u32) -> f64 {
+        let mut crossings = Vec::new();
+        let frames = samples.as_chunks::<2>().0;
+        for (i, frame) in frames[1000..frames.len() * 9 / 10].windows(2).enumerate() {
+            let (a, b) = (f64::from(frame[0][0]), f64::from(frame[1][0]));
+            if a < 0. && b >= 0. {
+                crossings.push(i as f64 - a / (b - a));
+            }
+        }
+        (crossings.len() - 1) as f64 * f64::from(sr) / (crossings.last().unwrap() - crossings[0])
+    }
+    let mut samples = SampleBank::new();
+    samples.insert(
+        "wave",
+        Sample::new(
+            (0..48000)
+                .map(|i| (std::f64::consts::TAU * 440. * i as f64 / 48000.).sin() as f32)
+                .collect::<Vec<_>>(),
+            48000,
+        )
+        .unwrap(),
+    );
+    for source in ["sine", "sample wave root:69 fade:0"] {
+        for sr in [8000, 44100] {
+            for note in [48., 60., 69., 76.] {
+                let mut cents = Vec::new();
+                let mut delays = Vec::new();
+                for amount in [0., 0.5, 1.] {
+                    let song = Song::parse(&format!(
+                    "cps 1\nsynth x humanize:{amount}\n  {source}\n  * gate\n  * .1\nplay x\n  {note} c4"
+                )).unwrap();
+                    // Use the first half-cycle: the second note makes numeric MIDI pitches absolute.
+                    let audio = song
+                        .render(RenderOptions {
+                            sample_rate: sr,
+                            samples: samples.clone(),
+                            ..options()
+                        })
+                        .unwrap();
+                    let samples = &audio.samples()[..sr as usize];
+                    let measured = frequency(samples, sr);
+                    let drift = 1200. * (measured / midi_to_frequency(note)).log2();
+                    assert!(
+                        drift.abs() <= 8. * amount + 0.1,
+                        "{sr} Hz, note {note}, amount {amount}: {drift} cents"
+                    );
+                    let onset = samples
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|frame| frame[0].abs() > 1e-12)
+                        .unwrap();
+                    assert!(onset as f64 <= 0.014 * amount * f64::from(sr) + 1.5);
+                    cents.push(drift);
+                    delays.push(onset);
+                }
+                assert!((cents[1] * 2. - cents[2]).abs() < 0.2);
+                assert!(cents[2].abs() > 0.1, "{source} should change pitch");
+                assert!(delays[2] > delays[0]);
+                assert!((delays[1] as isize * 2 - delays[2] as isize).abs() <= 2);
+            }
+        }
+    }
+}
+
+#[test]
+fn humanize_cancels_short_notes_and_retriggers_without_stale_delays() {
+    // The upstream slot-0 A4 fixture has an 11.33 ms onset delay at full amount.
+    let score = "cps 1\nsynth x humanize:1\n  1\n  * gate\n  * .1\nplay x\n  a4";
+    let short = Song::parse(&format!("{score}\n  dur: .001"))
+        .unwrap()
+        .render(options())
+        .unwrap();
+    assert_eq!(short.peak(), 0.);
+    let repeated = Song::parse(&format!("{score}*4"))
+        .unwrap()
+        .render(options())
+        .unwrap();
+    let frames = repeated.samples().as_chunks::<2>().0;
+    for step in 0..4 {
+        let start = step * 2000;
+        assert!(frames[start..start + 80].iter().all(|frame| frame[0] == 0.));
+        assert!(
+            frames[start + 112..start + 1960]
+                .iter()
+                .all(|frame| frame[0] > 0.01)
+        );
+    }
+}
+
+#[test]
+fn humanize_keeps_mono_slides_sounding_and_varies_unison_slots() {
+    let song = Song::parse(
+        "cps 1\nsynth x mono glide:.05 humanize:1\n  1\n  * gate\n  * .1\nplay x\n  a4'slide:1 c5",
+    )
+    .unwrap();
+    let audio = song.render(options()).unwrap();
+    assert!(
+        audio.samples()[7800..8200]
+            .iter()
+            .all(|sample| *sample > 0.01)
+    );
+    let score = |unison| {
+        format!(
+            "cps 1\nsynth x unison:{unison} detune:0 spread:0 humanize:1\n  sine\n  * gate\n  * .1\nplay x\n  a4"
+        )
+    };
+    let solo = Song::parse(&score(1)).unwrap().render(options()).unwrap();
+    let stack = Song::parse(&score(5)).unwrap().render(options()).unwrap();
+    let difference = solo
+        .samples()
+        .iter()
+        .zip(stack.samples())
+        .map(|(solo, stack)| (f64::from(*solo) - f64::from(*stack) / 5_f64.sqrt()).abs())
+        .fold(0., f64::max);
+    assert!(
+        difference > 0.01,
+        "unison slots should have independent offsets"
+    );
+}
+
+#[test]
 fn exact_peak_normalization_happens_after_mixing() {
     let a = tone("sine\n  * 10").render(options()).unwrap();
     assert!((a.peak() - 0.89).abs() < 1e-5);

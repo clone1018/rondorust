@@ -10,7 +10,7 @@ license = "MIT"
 readme = "README.md"
 keywords = ["bevy", "audio", "synthesizer", "rondocode", "music"]
 categories = ["game-development", "multimedia::audio"]
-include = ["src/**", "tests/**", "examples/**", "assets/**", "README.md", "CONTRIBUTING.md", "LICENSE", "NOTICE.md", "Cargo.toml"]
+include = ["src/**", "tests/**", "scripts/**", "examples/**", "assets/**", "README.md", "CONTRIBUTING.md", "LICENSE", "NOTICE.md", "Cargo.toml"]
 
 [package.metadata.docs.rs]
 all-features = true

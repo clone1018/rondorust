@@ -22,6 +22,10 @@ pub(crate) struct SynthDef {
     pub unison: usize,
     pub detune: f64,
     pub spread: f64,
+    pub curve: f64,
+    pub blend: f64,
+    pub octaves: usize,
+    pub humanize: f64,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct BusDef {
@@ -102,8 +106,7 @@ enum Lane {
 enum NoteTransform {
     Add(f64),
     Octave(f64),
-    Swing(f64, f64),
-    Echo(usize, f64, f64),
+    Echo(usize, f64, f64, bool),
     Arp(String),
     Every(usize, Box<NoteTransform>),
 }
@@ -193,6 +196,14 @@ impl Song {
                 }
                 "scaledef" => {
                     let name = language::identifier(line, 1)?.to_ascii_lowercase();
+                    if Scale::builtin(&name).is_some()
+                        || name.len() > 3
+                            && name.ends_with("edo")
+                            && name[..name.len() - 3].chars().all(|c| c.is_ascii_digit())
+                    {
+                        return Err(line
+                            .error("custom scale must not shadow a built-in mode or EDO tuning"));
+                    }
                     let mut at = 2;
                     let unit = fields.get(at).copied().unwrap_or("");
                     if matches!(unit, "cents" | "ratios") {
@@ -307,13 +318,29 @@ impl Song {
                 ));
             }
             let glide = *s.options.get("glide").unwrap_or(&0.);
-            let detune = *s.options.get("detune").unwrap_or(&12.);
-            let spread = *s.options.get("spread").unwrap_or(&0.5);
+            let detune = *s.options.get("detune").unwrap_or(&15.);
+            let spread = *s.options.get("spread").unwrap_or(&0.6);
+            let humanize = *s.options.get("humanize").unwrap_or(&0.);
+            let curve = *s.options.get("curve").unwrap_or(&1.);
+            let blend = *s.options.get("blend").unwrap_or(&1.);
+            let octaves = *s.options.get("octaves").unwrap_or(&0.);
             if !(0.0..=30.).contains(&glide)
                 || !(0.0..=1200.).contains(&detune)
                 || !(0.0..=1.).contains(&spread)
             {
                 return Err(Error::invalid("invalid glide, detune, or spread"));
+            }
+            if !(0.0..=1.).contains(&humanize) {
+                return Err(Error::invalid("humanize must be in 0..1"));
+            }
+            if !(0.2..=5.).contains(&curve)
+                || !(0.0..=1.).contains(&blend)
+                || !(0.0..=9.).contains(&octaves)
+                || octaves.fract() != 0.
+            {
+                return Err(Error::invalid(
+                    "curve must be in .2..5, blend in 0..1, and octaves an integer in 0..9",
+                ));
             }
             synths.push(SynthDef {
                 name: s.name.clone(),
@@ -325,6 +352,10 @@ impl Song {
                 unison: unison as usize,
                 detune,
                 spread,
+                curve,
+                blend,
+                octaves: octaves as usize,
+                humanize,
             });
         }
         if synths.len() > 128 {
@@ -712,15 +743,10 @@ impl Song {
                             *note += 12. * n;
                         }
                     }
-                    NoteTransform::Swing(amount, subdivision) => {
-                        let step = (onset * subdivision).floor() as i64;
-                        if step.rem_euclid(2) == 1 {
-                            time += amount / subdivision;
-                        }
-                    }
-                    NoteTransform::Echo(count, delay, decay) => {
+                    NoteTransform::Echo(count, delay, decay, ping) => {
                         for n in 1..*count {
-                            echoes.push((n as f64 * delay, decay.powi(n as i32)));
+                            let tap_pan = ping.then_some(if n % 2 == 1 { 0.85 } else { 0.15 });
+                            echoes.push((n as f64 * delay, decay.powi(n as i32), tap_pan));
                         }
                     }
                     NoteTransform::Arp(mode) => arp = Some(mode.as_str()),
@@ -730,11 +756,22 @@ impl Song {
                 }
             }
             let push = params.remove("__push").unwrap_or(0.);
+            let definition = self.data.synths.iter().find(|s| s.name == synth).unwrap();
+            for name in params.keys() {
+                if !definition.graph.params.iter().any(|p| p.name == *name)
+                    && !definition
+                        .post
+                        .as_ref()
+                        .is_some_and(|g| g.params.iter().any(|p| p.name == *name))
+                {
+                    return Err(Error::invalid(format!(
+                        "unknown parameter `{name}` for synth `{synth}`; declare a knob or macro used by its signal graph"
+                    )));
+                }
+            }
             time += push * (hap.whole.end - onset);
-            if let Some("down") = arp {
-                notes.reverse();
-            } else if arp.is_some_and(|mode| mode != "up") {
-                return Err(Error::invalid("arp mode must be up or down"));
+            if let Some(mode) = arp {
+                notes = arp_notes(notes, mode)?;
             }
             let note_count = notes.len();
             for (index, note) in notes.into_iter().enumerate() {
@@ -763,7 +800,7 @@ impl Song {
                         slide,
                     });
                 }
-                for &(delay, mult) in &echoes {
+                for &(delay, mult, tap_pan) in &echoes {
                     let at = note_start + delay;
                     if at < end && at >= 0. {
                         events.push(NoteEvent {
@@ -772,7 +809,7 @@ impl Song {
                             duration,
                             note,
                             gain: gain * mult,
-                            pan,
+                            pan: tap_pan.unwrap_or(pan),
                             params: params.clone(),
                             begin: slice.0,
                             end: slice.1,
@@ -789,11 +826,21 @@ impl Song {
     }
     fn resolve_scale(&self, name: &str) -> Result<(f64, Scale)> {
         let (root, mode) = name
-            .split_once('-')
+            .split_once(['-', '_'])
             .or_else(|| name.split_once(' '))
             .ok_or_else(|| {
                 Error::invalid(format!("scale `{name}` needs a root and mode (a-min)"))
             })?;
+        if root.len() > 2
+            || root
+                .as_bytes()
+                .get(1)
+                .is_some_and(|c| !matches!(c, b'#' | b'b'))
+        {
+            return Err(Error::invalid(
+                "scale root must be a note letter with optional #/b",
+            ));
+        }
         let note = note_to_midi(root).ok_or_else(|| Error::invalid("invalid scale root"))?;
         let pc = note.rem_euclid(12.);
         let root = if pc <= 6. { 60. + pc } else { 48. + pc };
@@ -841,10 +888,8 @@ fn parse_points(fields: &[&str], line: &Line) -> Result<Vec<(f64, f64, f64)>> {
     }
     let mut points = Vec::new();
     for pair in fields.as_chunks::<2>().0 {
-        let time = language::number(pair[0], line)?;
-        if time <= 0. {
-            return Err(line.error("curve segment lengths must be positive"));
-        }
+        // Upstream treats zero/negative automation durations as immediate jumps.
+        let time = language::number(pair[0], line)?.max(0.);
         let (level, curve) = pair[1].split_once(':').unwrap_or((pair[1], "0"));
         points.push((
             time,
@@ -986,7 +1031,16 @@ fn compile_play(
             .split([' ', '\t', '[', ']', '<', '>', '{', '}', ',', '|'])
             .map(|s| s.split('\'').next().unwrap_or(""))
             .any(|s| s.chars().next().is_some_and(|c| ('a'..='g').contains(&c)));
-        let pattern = Pattern::parse(&text).map_err(|e| line.error(e.to_string()))?;
+        let pattern = if text.split_whitespace().next() == Some("irand") {
+            if beat {
+                return Err(line.error(
+                    "irand makes scale degrees — it belongs in a `play` block, not `beat`",
+                ));
+            }
+            irand_pattern(&text, line)?
+        } else {
+            Pattern::parse(&text).map_err(|e| line.error(e.to_string()))?
+        };
         channels.push(Channel {
             pattern,
             synth: route,
@@ -1017,6 +1071,27 @@ fn compile_play(
         channels = next;
     }
     Ok(channels)
+}
+fn irand_pattern(text: &str, line: &Line) -> Result<Pattern> {
+    let fields: Vec<_> = text.split_whitespace().collect();
+    let syntax =
+        || line.error("irand notation is `irand N [seg:M]` (N random degrees, M steps per cycle)");
+    let integer = |text: &str| -> Result<u32> {
+        if text.is_empty() || !text.bytes().all(|c| c.is_ascii_digit()) {
+            return Err(syntax());
+        }
+        text.parse().map_err(|_| syntax())
+    };
+    if !(2..=3).contains(&fields.len()) {
+        return Err(syntax());
+    }
+    let range = integer(fields[1])?;
+    let steps = if let Some(text) = fields.get(2) {
+        integer(text.strip_prefix("seg:").ok_or_else(syntax)?)? as usize
+    } else {
+        8
+    };
+    Pattern::irand(range, steps).map_err(|e| line.error(e.to_string()))
 }
 fn apply_channel_modifier(
     mut channel: Channel,
@@ -1117,7 +1192,16 @@ fn expand_patdefs(
     let mut at = 0;
     while at < text.len() {
         let c = text[at..].chars().next().unwrap();
-        if c.is_ascii_alphabetic() || c == '_' {
+        if c == '$' {
+            let start = at;
+            at += 1;
+            while at < text.len()
+                && (text.as_bytes()[at].is_ascii_alphanumeric() || text.as_bytes()[at] == b'_')
+            {
+                at += 1;
+            }
+            out.push_str(&text[start..at]);
+        } else if c.is_ascii_alphabetic() || c == '_' {
             let start = at;
             at += c.len_utf8();
             while at < text.len()
@@ -1159,6 +1243,18 @@ fn apply_modifier(
         && !key.contains(char::is_whitespace)
         && !COMBINATORS.contains(&key.to_ascii_lowercase().as_str())
     {
+        if key == "overchord" {
+            return Err(line.error("overchord is not implemented in this native port"));
+        }
+        if key == "cycles" {
+            let cycles = language::number(value.trim(), line)?;
+            if cycles < 1. || cycles.fract() != 0. {
+                return Err(line.error("cycles needs a positive integer"));
+            }
+            // Upstream's p() ignores this editor clip-length metadata. Native
+            // render length is selected through RenderOptions instead.
+            return Ok(());
+        }
         channel.controls.push(Control {
             name: key.into(),
             lane: Lane::parse(value.trim(), line, macros, curves)?,
@@ -1173,6 +1269,22 @@ fn apply_modifier(
         .trim_end_matches(':')
         .to_ascii_lowercase();
     let rest = text[text.find(char::is_whitespace).unwrap_or(text.len())..].trim();
+    let bounds = match name.as_str() {
+        "rev" | "palindrome" | "degrade" | "onsetsonly" => Some((0, 0)),
+        "fast" | "slow" | "early" | "late" | "ply" | "iter" | "iterback" | "segment" | "chop"
+        | "striate" | "linger" | "degradeby" | "undegradeby" | "add" | "sub" | "mul" | "div"
+        | "octave" => Some((1, 1)),
+        "roll" | "swingby" => Some((1, 2)),
+        "swing" | "arp" => Some((0, 1)),
+        "euclid" | "euclidinv" | "echo" | "ping" | "humanizeby" => Some((2, 3)),
+        _ => None,
+    };
+    if let Some((min, max)) = bounds {
+        let count = rest.split_whitespace().count();
+        if count < min || count > max {
+            return Err(line.error(format!("{name} expects {min}..{max} arguments")));
+        }
+    }
     let num = |n: usize, default: Option<f64>| -> Result<f64> {
         if let Some(s) = rest.split_whitespace().nth(n) {
             language::number(s.trim_end_matches(':'), line)
@@ -1223,6 +1335,24 @@ fn apply_modifier(
             every,
         }),
         "rev" => channel.pattern = channel.pattern.rev(),
+        "onsetsonly" => channel.pattern = channel.pattern.onsets_only(),
+        "humanizeby" => {
+            let grid = num(1, None)?;
+            let seed = num(2, Some(46.))?;
+            if grid.fract() != 0.
+                || !(1.0..=4096.).contains(&grid)
+                || seed.fract() != 0.
+                || !(0.0..=u32::MAX as f64).contains(&seed)
+            {
+                return Err(
+                    line.error("humanizeby needs grid in 1..4096 and a nonnegative integer seed")
+                );
+            }
+            channel.pattern =
+                channel
+                    .pattern
+                    .humanize_by(num(0, None)?, grid as usize, seed as u64)?;
+        }
         "fast" => channel.pattern = channel.pattern.fast(num(0, None)?)?,
         "ply" | "roll" | "iter" | "iterback" | "segment" | "chop" | "striate" => {
             let n = num(0, None)?;
@@ -1295,21 +1425,19 @@ fn apply_modifier(
             .push(NoteTransform::Octave(num(0, None)?)),
         "swing" | "swingby" => {
             let (amount, subdivision) = if name == "swing" {
-                (1. / 3., 2. * num(0, Some(4.))?)
+                (1. / 3., num(0, Some(4.))?)
             } else {
-                (num(0, None)?, 2. * num(1, Some(4.))?)
+                (num(0, None)?, num(1, Some(4.))?)
             };
             if !(0.0..=1.).contains(&amount)
-                || !(2.0..=8192.).contains(&subdivision)
+                || !(1.0..=4096.).contains(&subdivision)
                 || subdivision.fract() != 0.
             {
                 return Err(line.error("invalid swing amount/subdivision"));
             }
-            channel
-                .transforms
-                .push(NoteTransform::Swing(amount, subdivision));
+            channel.pattern = channel.pattern.swing_by(amount, subdivision as usize)?;
         }
-        "echo" => {
+        "echo" | "ping" => {
             let count = num(0, None)?;
             let delay = num(1, None)?;
             let decay = num(2, Some(0.5))?;
@@ -1320,15 +1448,22 @@ fn apply_modifier(
             {
                 return Err(line.error("invalid echo settings"));
             }
-            channel
-                .transforms
-                .push(NoteTransform::Echo(count as usize, delay, decay));
+            channel.transforms.push(NoteTransform::Echo(
+                count as usize,
+                delay,
+                decay,
+                name == "ping",
+            ));
         }
         "arp" => {
-            if !matches!(rest, "up" | "down") {
-                return Err(line.error("arp supports up or down"));
+            let mode = if rest.is_empty() { "up" } else { rest };
+            if !matches!(
+                mode,
+                "up" | "down" | "updown" | "downup" | "updowninc" | "converge"
+            ) {
+                return Err(line.error("unknown arp mode"));
             }
-            channel.transforms.push(NoteTransform::Arp(rest.to_owned()));
+            channel.transforms.push(NoteTransform::Arp(mode.to_owned()));
         }
         _ => return Err(line.error(format!("pattern modifier `{name}` is not implemented"))),
     }
@@ -1356,8 +1491,10 @@ impl Lane {
             "sine"
                 | "sine2"
                 | "cosine"
+                | "cosine2"
                 | "saw"
                 | "isaw"
+                | "isaw2"
                 | "saw2"
                 | "tri"
                 | "tri2"
@@ -1373,7 +1510,11 @@ impl Lane {
             let mut lo = 0.;
             let mut hi = 1.;
             let mut speed = 1.;
-            let mut period = 1.;
+            let mut period = if matches!(shape, "rise" | "fall") {
+                8.
+            } else {
+                1.
+            };
             let mut at = 1;
             let mut points = Vec::new();
             if matches!(shape, "rise" | "fall")
@@ -1412,8 +1553,10 @@ impl Lane {
                     .cloned()
                     .ok_or_else(|| line.error("unknown named curve"))?;
                 let sum: f64 = points.iter().map(|p| p.0).sum();
-                for p in &mut points {
-                    p.0 = p.0 / sum * period;
+                if sum > 0. {
+                    for p in &mut points {
+                        p.0 = p.0 / sum * period;
+                    }
                 }
             }
             for field in &fields[at..] {
@@ -1430,7 +1573,8 @@ impl Lane {
             }
             if !speed.is_finite()
                 || !(1.0 / 4096.0..=4096.0).contains(&speed)
-                || period <= 0.
+                || period < 0.
+                || (period == 0. && shape != "curve")
                 || !period.is_finite()
             {
                 return Err(line.error("invalid control signal speed/period"));
@@ -1466,23 +1610,25 @@ impl Lane {
                     "sine" => 0.5 + 0.5 * (TAU * t).sin(),
                     "sine2" => (TAU * t).sin(),
                     "cosine" => 0.5 + 0.5 * (TAU * t).cos(),
+                    "cosine2" => (TAU * t).cos(),
                     "saw" => phase,
                     "saw2" => 2. * phase - 1.,
                     "isaw" => 1. - phase,
+                    "isaw2" => 1. - 2. * phase,
                     "tri" => 1. - (2. * phase - 1.).abs(),
                     "tri2" => 1. - 2. * (2. * phase - 1.).abs(),
                     "square" => {
                         if phase < 0.5 {
-                            1.
-                        } else {
                             0.
+                        } else {
+                            1.
                         }
                     }
                     "square2" => {
                         if phase < 0.5 {
-                            1.
-                        } else {
                             -1.
+                        } else {
+                            1.
                         }
                     }
                     "rand" => time_hash(t, 0),
@@ -1492,13 +1638,17 @@ impl Lane {
                         let f = phase * phase * (3. - 2. * phase);
                         a + (b - a) * f
                     }
-                    "rise" => (t / period).clamp(0., 1.),
-                    "fall" => 1. - (t / period).clamp(0., 1.),
+                    "rise" => (t / period).rem_euclid(1.),
+                    "fall" => 1. - (t / period).rem_euclid(1.),
                     "curve" | "shape" => {
                         let mut remaining = t.max(0.);
                         let mut previous = 0.;
                         let mut value = points.last().map(|p| p.1).unwrap_or(0.);
                         for &(duration, target, curve) in points {
+                            if duration == 0. {
+                                previous = target;
+                                continue;
+                            }
                             if remaining <= duration {
                                 let f = (remaining / duration).clamp(0., 1.);
                                 let f = if curve.abs() < 1e-8 {
@@ -1522,6 +1672,9 @@ impl Lane {
     }
 }
 fn chord_notes(text: &str) -> Result<Vec<f64>> {
+    let (text, bass) = text
+        .split_once('/')
+        .map_or((text, None), |(chord, bass)| (chord, Some(bass)));
     let root_len = if text
         .as_bytes()
         .get(1)
@@ -1533,6 +1686,12 @@ fn chord_notes(text: &str) -> Result<Vec<f64>> {
     };
     let root = &text[..root_len];
     let quality = &text[root_len..];
+    let lower = quality.to_ascii_lowercase();
+    let quality = if matches!(quality, "M" | "M7") {
+        quality
+    } else {
+        lower.as_str()
+    };
     let root =
         note_to_midi(&format!("{root}3")).ok_or_else(|| Error::invalid("invalid chord root"))?;
     let intervals: &[f64] = match quality {
@@ -1568,5 +1727,42 @@ fn chord_notes(text: &str) -> Result<Vec<f64>> {
         "m13" => &[0., 3., 7., 10., 14., 21.],
         _ => return Err(Error::invalid(format!("unknown chord quality `{quality}`"))),
     };
-    Ok(intervals.iter().map(|n| root + n).collect())
+    let mut notes: Vec<_> = intervals.iter().map(|n| root + n).collect();
+    if let Some(bass) = bass {
+        if bass.is_empty()
+            || bass.len() > 2
+            || bass
+                .as_bytes()
+                .get(1)
+                .is_some_and(|c| !matches!(c, b'#' | b'b'))
+        {
+            return Err(Error::invalid("invalid slash chord bass"));
+        }
+        let mut bass = note_to_midi(&format!("{bass}3"))
+            .ok_or_else(|| Error::invalid("invalid slash chord bass"))?;
+        while bass >= root {
+            bass -= 12.;
+        }
+        notes.insert(0, bass);
+    }
+    Ok(notes)
+}
+fn arp_notes(mut notes: Vec<f64>, mode: &str) -> Result<Vec<f64>> {
+    if notes.len() < 2 {
+        return Ok(notes);
+    }
+    notes.sort_by(f64::total_cmp);
+    let n = notes.len();
+    let indices: Vec<usize> = match mode {
+        "up" => (0..n).collect(),
+        "down" => (0..n).rev().collect(),
+        "updown" => (0..n).chain((1..n.saturating_sub(1)).rev()).collect(),
+        "downup" => (0..n).rev().chain(1..n.saturating_sub(1)).collect(),
+        "updowninc" => (0..n).chain((0..n).rev()).collect(),
+        "converge" => (0..n)
+            .map(|i| if i % 2 == 0 { i / 2 } else { n - 1 - i / 2 })
+            .collect(),
+        _ => return Err(Error::invalid("unknown arp mode")),
+    };
+    Ok(indices.into_iter().map(|i| notes[i]).collect())
 }

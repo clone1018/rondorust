@@ -51,6 +51,7 @@ impl Graph {
                         .unwrap_or(0),
                     Op::Reverb(_, _) => sr * 26_000 / 44_100 + 32,
                     Op::Chorus | Op::Flanger => sr / 10 * 2 + 4,
+                    Op::Width(seconds) => (sr as f64 * seconds).round() as usize * 2 + 2,
                     Op::Limiter { lookahead, .. } => {
                         (sr as f64 * lookahead / 1000.).round() as usize * 2 + 2
                     }
@@ -278,7 +279,7 @@ enum Op {
     Bitcrush(usize, usize),
     Shape(String),
     Pan,
-    Width,
+    Width(f64),
     Math(Math),
     Eq(Vec<(String, f64, f64, f64)>),
     Chorus,
@@ -426,7 +427,19 @@ impl Compiler<'_> {
                 });
                 self.node(Op::Param(index), vec![])
             }
-            Expr::Call(name, args, named) => self.call(name, args, named),
+            Expr::Call(name, args, named) => {
+                if self.bindings.contains_key(name) || self.macros.contains_key(name) {
+                    if args.is_empty() && named.is_empty() {
+                        self.expr(&Expr::Ref(name.clone()), None)
+                    } else {
+                        Err(Error::invalid(format!(
+                            "binding `{name}` shadows the builtin used in this chain; rename the binding"
+                        )))
+                    }
+                } else {
+                    self.call(name, args, named)
+                }
+            }
             Expr::Word(_) | Expr::Curved(_, _) => {
                 Err(Error::invalid("enum/curve is not an audio signal"))
             }
@@ -839,7 +852,9 @@ impl Compiler<'_> {
                     if !matches!(mode.as_str(), "wide" | "tight") {
                         return Err(Error::invalid("width mode must be wide or tight"));
                     }
-                    Op::Width
+                    let seconds = if mode == "tight" { 0.003 } else { 0.012 };
+                    self.tail = self.tail.max(seconds);
+                    Op::Width(seconds)
                 } else {
                     Op::Pan
                 }
@@ -1092,6 +1107,7 @@ impl State {
             Op::PitchShift { window } => vec![(sr * window / 1000.).round() as usize * 2 + 4; 2],
             Op::Looper { max } => vec![(sr * max).ceil() as usize; 2],
             Op::Limiter { lookahead, .. } => vec![(sr * lookahead / 1000.).round() as usize + 1; 2],
+            Op::Width(seconds) => vec![(sr * seconds).round().max(1.) as usize + 1; 2],
             _ => vec![],
         };
         let total: usize = sizes.iter().sum();
@@ -1576,7 +1592,7 @@ impl GraphInstance {
                             let pos =
                                 input(1, 0).clamp(0., 1.) * (sample.data.len() - 1) as f64 + jitter;
                             let rate = input(2, 0)
-                                * 2_f64.powf((ctx.note - root) / 12.)
+                                * (ctx.frequency / crate::midi_to_frequency(*root))
                                 * f64::from(sample.sample_rate)
                                 / sr;
                             let grain = &mut s.extra[slot * 4..slot * 4 + 4];
@@ -1968,7 +1984,7 @@ impl GraphInstance {
                         y *= ((p - lo) / fade_samples)
                             .min((hi - p) / fade_samples)
                             .clamp(0., 1.);
-                        let step = 2.0_f64.powf((ctx.note - root) / 12.)
+                        let step = (ctx.frequency / crate::midi_to_frequency(*root))
                             * f64::from(sample.sample_rate)
                             / sr
                             * input(2, 0);
@@ -2147,14 +2163,16 @@ impl GraphInstance {
                         input(0, 1) * angle.sin() * 2_f64.sqrt(),
                     ];
                 }
-                Op::Width => {
-                    let mid = (input(0, 0) + input(0, 1)) * 0.5;
-                    let x = input(0, 1);
-                    let a = 0.7;
-                    let wet = -a * x + s.mem[1][0];
-                    s.mem[1][0] = x + a * wet;
-                    let side = (input(0, 0) - wet) * 0.5 * input(1, 0).clamp(0., 1.);
-                    out = [mid + side, mid - side];
+                Op::Width(seconds) => {
+                    let amount = input(1, 0).clamp(0., 1.);
+                    let gain = 1. / (1. + amount * amount).sqrt();
+                    let delay = (seconds * sr).round().max(1.);
+                    for (ch, y) in out.iter_mut().enumerate() {
+                        let x = input(0, ch);
+                        let wet = tap(&s.ring[ch], s.positions[ch], delay);
+                        *y = (x + if ch == 0 { amount * wet } else { -amount * wet }) * gain;
+                        ring_write(s, ch, x);
+                    }
                 }
                 Op::Math(math) => {
                     for (ch, y) in out.iter_mut().enumerate() {

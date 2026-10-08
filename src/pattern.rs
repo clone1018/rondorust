@@ -1,6 +1,6 @@
 //! Pure cycle-based mini-notation queries. A cycle is one musical bar.
 use crate::{Error, Result};
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 const LIMIT: usize = 100_000;
 const DEPTH: usize = 64;
@@ -63,10 +63,14 @@ impl Hap {
 enum Node {
     Rest,
     Atom(Value),
+    Irand(u32, usize),
+    Swing(Pattern, f64, usize),
+    Humanize(Pattern, f64, usize, u64),
+    OnsetsOnly(Pattern),
     Sequence(Vec<(Pattern, f64)>),
     Stack(Vec<Pattern>),
     Alternate(Vec<Pattern>),
-    Choose(Vec<Pattern>),
+    Choose(Vec<(Pattern, f64)>),
     Speed(Pattern, Pattern, bool),
     Euclid(Pattern, Pattern, Pattern, Pattern, bool),
     Degrade(Pattern, f64),
@@ -98,7 +102,30 @@ impl Pattern {
             at: 0,
             depth: 0,
             terms: 0,
+            motifs: BTreeMap::new(),
         };
+        loop {
+            parser.space();
+            if parser.peek() != Some('$') {
+                break;
+            }
+            let start = parser.at;
+            let name = parser.motif_name()?;
+            if !parser.take('=') {
+                parser.at = start;
+                break;
+            }
+            if parser.motifs.contains_key(&name) {
+                return Err(parser.error("motif is already defined on this line"));
+            }
+            parser.space();
+            let (figure, _, _) = parser.term()?;
+            parser.motifs.insert(name, figure);
+        }
+        parser.space();
+        if parser.peek().is_none() && !parser.motifs.is_empty() {
+            return Err(parser.error("this line defines a motif but never plays one"));
+        }
         let result = parser.group(None)?;
         parser.space();
         if parser.at != source.len() {
@@ -111,6 +138,18 @@ impl Pattern {
     }
     pub fn atom(value: Value) -> Self {
         Self::new(Node::Atom(value))
+    }
+    /// Sample deterministic integer noise at each step's whole-span midpoint.
+    pub(crate) fn irand(range: u32, steps: usize) -> Result<Self> {
+        if range == 0 {
+            return Err(Error::invalid(
+                "irand needs a positive integer degree count",
+            ));
+        }
+        if !(1..=4096).contains(&steps) {
+            return Err(Error::invalid("irand seg must be an integer in 1..4096"));
+        }
+        Ok(Self::new(Node::Irand(range, steps)))
     }
     fn num(n: f64) -> Self {
         Self::atom(Value::Number(n))
@@ -142,6 +181,25 @@ impl Pattern {
             return Err(Error::invalid("shift must be finite"));
         }
         Ok(Self::new(Node::Shift(self.clone(), cycles)))
+    }
+    /// Delay the odd half-subdivisions by `amount / (2 * subdivisions)` cycles.
+    pub fn swing_by(&self, amount: f64, subdivisions: usize) -> Result<Self> {
+        timing_args(amount, subdivisions)?;
+        Ok(Self::new(Node::Swing(self.clone(), amount, subdivisions)))
+    }
+    /// Deterministic late-only timing jitter, independent of the chance stream.
+    pub fn humanize_by(&self, amount: f64, subdivisions: usize, seed: u64) -> Result<Self> {
+        timing_args(amount, subdivisions)?;
+        Ok(Self::new(Node::Humanize(
+            self.clone(),
+            amount,
+            subdivisions,
+            seed,
+        )))
+    }
+    /// Keep only fragments containing their event's onset.
+    pub fn onsets_only(&self) -> Self {
+        Self::new(Node::OnsetsOnly(self.clone()))
     }
     pub fn degrade_by(&self, probability: f64) -> Result<Self> {
         if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
@@ -293,11 +351,69 @@ impl Pattern {
                     }
                 }
             }
+            Node::Irand(range, steps) => {
+                for cycle in span.begin.floor() as i64..span.end.ceil() as i64 {
+                    let c = cycle as f64;
+                    let first = ((span.begin - c) * *steps as f64).floor().max(0.) as usize;
+                    let last = (((span.end - c) * *steps as f64).ceil() as usize).min(*steps);
+                    for step in first..last {
+                        spend(budget)?;
+                        let whole = TimeSpan {
+                            begin: c + step as f64 / *steps as f64,
+                            end: c + (step + 1) as f64 / *steps as f64,
+                        };
+                        if let Some(part) = whole.intersect(span) {
+                            let midpoint = (whole.begin + whole.end) * 0.5;
+                            out.push(Hap {
+                                whole,
+                                part,
+                                value: Value::Number(
+                                    (time_hash(midpoint, 0) * f64::from(*range)).floor(),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
             Node::Stack(children) => {
                 for child in children {
                     out.extend(child.eval(span, budget, depth + 1)?);
                 }
             }
+            Node::Swing(child, amount, subdivisions)
+            | Node::Humanize(child, amount, subdivisions, _) => {
+                let max = amount / (2 * subdivisions) as f64;
+                for mut hap in child.eval(
+                    TimeSpan {
+                        begin: span.begin - max,
+                        end: span.end,
+                    },
+                    budget,
+                    depth + 1,
+                )? {
+                    let shift = match &*self.0 {
+                        Node::Humanize(_, _, _, seed) => {
+                            (time_hash(hap.whole.begin, *seed) * 64.).floor() / 64. * max
+                        }
+                        _ => {
+                            let step = (hap.whole.begin.rem_euclid(1.) * (2 * subdivisions) as f64)
+                                .floor() as usize;
+                            if step % 2 == 1 { max } else { 0. }
+                        }
+                    };
+                    hap = hap.map(|t| t + shift);
+                    if let Some(part) = hap.part.intersect(span) {
+                        hap.part = part;
+                        out.push(hap);
+                    }
+                }
+            }
+            Node::OnsetsOnly(child) => out.extend(
+                child
+                    .eval(span, budget, depth + 1)?
+                    .into_iter()
+                    .filter(|hap| (hap.whole.begin - hap.part.begin).abs() < 1e-10),
+            ),
             Node::Sequence(children) => {
                 let total: f64 = children.iter().map(|x| x.1).sum();
                 if total <= 0.0 {
@@ -327,7 +443,27 @@ impl Pattern {
                     }
                 }
             }
-            Node::Alternate(children) | Node::Choose(children) => {
+            Node::Choose(children) => {
+                let total: f64 = children.iter().map(|(_, weight)| weight).sum();
+                for cycle in span.begin.floor() as i64..span.end.ceil() as i64 {
+                    spend(budget)?;
+                    let c = cycle as f64;
+                    if let Some(part) = span.intersect(TimeSpan {
+                        begin: c,
+                        end: c + 1.,
+                    }) {
+                        let mut pick = time_hash(c, 0) * total;
+                        for (child, weight) in children {
+                            if pick < *weight {
+                                out.extend(child.eval(part, budget, depth + 1)?);
+                                break;
+                            }
+                            pick -= weight;
+                        }
+                    }
+                }
+            }
+            Node::Alternate(children) => {
                 if children.is_empty() {
                     return Ok(out);
                 }
@@ -338,14 +474,10 @@ impl Pattern {
                         begin: c,
                         end: c + 1.0,
                     }) {
-                        let (index, shift) = if matches!(&*self.0, Node::Choose(_)) {
-                            ((time_hash(c, 0) * children.len() as f64) as usize, 0.0)
-                        } else {
-                            (
-                                cycle.rem_euclid(children.len() as i64) as usize,
-                                c - cycle.div_euclid(children.len() as i64) as f64,
-                            )
-                        };
+                        let (index, shift) = (
+                            cycle.rem_euclid(children.len() as i64) as usize,
+                            c - cycle.div_euclid(children.len() as i64) as f64,
+                        );
                         out.extend(
                             children[index]
                                 .eval(part.map(|t| t - shift), budget, depth + 1)?
@@ -402,9 +534,10 @@ impl Pattern {
                     if s < 1.0 || s > 4096.0 || s.fract() != 0.0 || p.fract() != 0.0 {
                         continue;
                     }
-                    let rhythm = bjorklund(p.max(0.0) as usize, s as usize)?;
+                    let rhythm = bjorklund(p.abs() as usize, s as usize)?;
+                    let invert = *invert ^ (p < 0.);
                     for step in 0..s as usize {
-                        if rhythm[(step as i64 + r as i64).rem_euclid(s as i64) as usize] == *invert
+                        if rhythm[(step as i64 + r as i64).rem_euclid(s as i64) as usize] == invert
                         {
                             continue;
                         }
@@ -729,6 +862,15 @@ struct Parser<'a> {
     at: usize,
     depth: usize,
     terms: usize,
+    motifs: BTreeMap<String, Pattern>,
+}
+fn timing_args(amount: f64, subdivisions: usize) -> Result<()> {
+    if !amount.is_finite() || !(0.0..=1.).contains(&amount) || !(1..=4096).contains(&subdivisions) {
+        return Err(Error::invalid(
+            "timing needs an amount in 0..1 and subdivisions in 1..4096",
+        ));
+    }
+    Ok(())
 }
 impl Parser<'_> {
     fn error(&self, message: &str) -> Error {
@@ -761,9 +903,10 @@ impl Parser<'_> {
         if self.depth > DEPTH {
             return Err(self.error("mini-notation nesting limit exceeded"));
         }
-        let mut stacks = Vec::new();
+        let mut branches = Vec::new();
+        let mut separator = None;
         let mut dots = Vec::new();
-        let mut seq = Vec::new();
+        let mut seq: Vec<(Pattern, f64)> = Vec::new();
         loop {
             self.space();
             let next = self.peek();
@@ -774,12 +917,33 @@ impl Parser<'_> {
                 if close.is_some() {
                     self.bump();
                 }
+                let weight = if dots.is_empty() && seq.len() == 1 {
+                    seq[0].1
+                } else {
+                    1.
+                };
+                dots.push(sequence(seq));
+                branches.push((
+                    sequence(dots.into_iter().map(|p| (p, 1.)).collect()),
+                    weight,
+                ));
                 break;
             }
-            if next == Some(',') {
+            if matches!(next, Some(',' | '|')) {
+                if separator.is_some_and(|s| Some(s) != next) {
+                    return Err(
+                        self.error("stack ',' and choice '|' need separate bracketed groups")
+                    );
+                }
+                separator = next;
                 self.bump();
+                let weight = if dots.is_empty() && seq.len() == 1 {
+                    seq[0].1
+                } else {
+                    1.
+                };
                 dots.push(sequence(std::mem::take(&mut seq)));
-                stacks.push(sequence(dots.drain(..).map(|p| (p, 1.0)).collect()));
+                branches.push((sequence(dots.drain(..).map(|p| (p, 1.0)).collect()), weight));
                 continue;
             }
             if next == Some('.')
@@ -811,14 +975,31 @@ impl Parser<'_> {
                 seq.push((term.clone(), weight));
             }
         }
-        dots.push(sequence(seq));
-        stacks.push(sequence(dots.into_iter().map(|p| (p, 1.0)).collect()));
         self.depth -= 1;
-        Ok(if stacks.len() == 1 {
-            stacks.remove(0)
+        Ok(if branches.len() == 1 {
+            branches.remove(0).0
+        } else if separator == Some('|') {
+            Pattern::new(Node::Choose(branches))
         } else {
-            Pattern::stack(stacks)
+            Pattern::stack(branches.into_iter().map(|(p, _)| p).collect())
         })
+    }
+    fn motif_name(&mut self) -> Result<String> {
+        self.bump(); // '$'; the name must be adjacent.
+        let start = self.at;
+        if !self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
+            return Err(self.error("'$' needs a name directly after it"));
+        }
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            self.bump();
+        }
+        Ok(self.source[start..self.at].to_owned())
     }
     fn term(&mut self) -> Result<(Pattern, f64, usize)> {
         self.terms += 1;
@@ -826,19 +1007,22 @@ impl Parser<'_> {
         if self.terms > 4096 || self.depth > DEPTH {
             return Err(self.error("mini-notation nesting/term limit exceeded"));
         }
+        let grouped = matches!(self.peek(), Some('[' | '<' | '{'));
         let mut pat = match self.peek() {
+            Some('$') => {
+                let name = self.motif_name()?;
+                self.motifs
+                    .get(&name)
+                    .cloned()
+                    .ok_or_else(|| self.error(&format!("motif '${name}' is not defined")))?
+            }
             Some('[') => {
                 self.bump();
                 self.group(Some(']'))?
             }
             Some('<') => {
                 self.bump();
-                self.space();
-                if self.peek() == Some('>') {
-                    return Err(self.error("empty alternation"));
-                }
-                let x = self.group(Some('>'))?;
-                alternate(x)
+                self.alternation()?
             }
             Some('{') => {
                 self.bump();
@@ -911,12 +1095,36 @@ impl Parser<'_> {
                 }) {
                     self.bump();
                 }
+                // A named slash bass is part of a chord atom; numeric /N
+                // remains mini-notation slowdown.
+                if ('A'..='G').contains(&c)
+                    && self.peek() == Some('/')
+                    && self.source[self.at + 1..]
+                        .starts_with(|c: char| ('a'..='g').contains(&c.to_ascii_lowercase()))
+                {
+                    self.bump();
+                    self.bump();
+                    if self.peek().is_some_and(|c| matches!(c, '#' | 'b')) {
+                        self.bump();
+                    }
+                }
                 Pattern::atom(Value::Text(self.source[start..self.at].to_owned()))
             }
             _ => return Err(self.error("expected a note, rest, or group")),
         };
+        if let Node::Atom(Value::Text(text)) = &*pat.0 {
+            for lane in text.split('\'').skip(1) {
+                let key = lane.split(':').next().unwrap_or("");
+                if matches!(key, "swing" | "humanize" | "grid") {
+                    return Err(self.error(&format!(
+                        "'{key}: is a timing lane for a group; put brackets around the notes"
+                    )));
+                }
+            }
+        }
         let mut weight = 1.0;
         let mut repeats = 1;
+        let mut grooved = false;
         loop {
             self.space();
             match self.peek() {
@@ -954,13 +1162,10 @@ impl Parser<'_> {
                     };
                     pat = pat.degrade_by(p)?;
                 }
-                Some('|') => {
-                    self.bump();
-                    self.space();
-                    let (other, _, _) = self.term()?;
-                    pat = Pattern::new(Node::Choose(vec![pat, other]));
-                }
                 Some('(') => {
+                    if grooved {
+                        return Err(self.error("euclid cannot follow a group timing lane"));
+                    }
                     self.bump();
                     let pulses = self.argument()?;
                     if !self.take(',') {
@@ -975,11 +1180,58 @@ impl Parser<'_> {
                     if !self.take(')') {
                         return Err(self.error("unclosed euclid"));
                     }
-                    let invert = self.peek() == Some('!');
-                    if invert {
+                    pat = Pattern::new(Node::Euclid(pat, pulses, steps, rotation, false));
+                }
+                Some('\'') if grouped => {
+                    let mut lanes = BTreeMap::new();
+                    while self.peek() == Some('\'') {
                         self.bump();
+                        let start = self.at;
+                        while self
+                            .peek()
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        {
+                            self.bump();
+                        }
+                        let key = &self.source[start..self.at];
+                        if !matches!(key, "swing" | "humanize" | "grid" | "push") {
+                            return Err(self.error(
+                                "groups accept only 'swing:, 'humanize:, 'grid:, and 'push:",
+                            ));
+                        }
+                        if !self.take(':') {
+                            return Err(self.error("group timing lane needs name:value"));
+                        }
+                        let value = self.number()?;
+                        if lanes.insert(key.to_owned(), value).is_some() {
+                            return Err(self.error("duplicate group timing lane"));
+                        }
                     }
-                    pat = Pattern::new(Node::Euclid(pat, pulses, steps, rotation, invert));
+                    let grid = *lanes.get("grid").unwrap_or(&4.);
+                    if grid.fract() != 0. || !(1.0..=4096.).contains(&grid) {
+                        return Err(self.error("'grid: must be an integer in 1..4096"));
+                    }
+                    if lanes.contains_key("grid")
+                        && !lanes.contains_key("swing")
+                        && !lanes.contains_key("humanize")
+                    {
+                        return Err(self.error("'grid: needs 'swing: or 'humanize:"));
+                    }
+                    if let Some(&amount) = lanes.get("swing") {
+                        pat = pat.swing_by(amount, grid as usize)?;
+                    }
+                    if let Some(&amount) = lanes.get("humanize") {
+                        pat = pat.humanize_by(amount, grid as usize, 46)?;
+                    }
+                    if let Some(&push) = lanes.get("push") {
+                        if !(0.0..=4096.).contains(&push) {
+                            return Err(
+                                self.error("'push: on a group must be in 0..4096 (late-only)")
+                            );
+                        }
+                        pat = pat.shift(push)?;
+                    }
+                    grooved = true;
                 }
                 _ => break,
             }
@@ -996,10 +1248,59 @@ impl Parser<'_> {
             }
             Some('<') => {
                 self.bump();
-                let x = self.group(Some('>'))?;
-                Ok(alternate(x))
+                self.alternation()
             }
             _ => Ok(Pattern::num(self.number()?)),
+        }
+    }
+    fn alternation(&mut self) -> Result<Pattern> {
+        let mut voices = Vec::new();
+        loop {
+            let mut parts: Vec<(Pattern, f64)> = Vec::new();
+            loop {
+                self.space();
+                if matches!(self.peek(), None | Some('>' | ',')) {
+                    break;
+                }
+                if self.peek() == Some('_')
+                    && self.source[self.at + 1..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                {
+                    self.bump();
+                    let last = parts
+                        .last_mut()
+                        .ok_or_else(|| self.error("elongation needs a preceding note"))?;
+                    last.1 += 1.;
+                    continue;
+                }
+                let (part, weight, repeats) = self.term()?;
+                for _ in 0..repeats {
+                    parts.push((part.clone(), weight));
+                }
+            }
+            if parts.is_empty() {
+                return Err(self.error("empty alternation voice"));
+            }
+            let voice = if parts.iter().all(|(_, weight)| *weight == 1.) {
+                Pattern::new(Node::Alternate(parts.into_iter().map(|(p, _)| p).collect()))
+            } else {
+                let total: f64 = parts.iter().map(|(_, weight)| weight).sum();
+                Pattern::new(Node::Sequence(parts)).slow(total)?
+            };
+            voices.push(voice);
+            if self.take(',') {
+                continue;
+            }
+            if !self.take('>') {
+                return Err(self.error("unclosed alternation; choice requires a bracketed group"));
+            }
+            return Ok(if voices.len() == 1 {
+                voices.remove(0)
+            } else {
+                Pattern::stack(voices)
+            });
         }
     }
     fn number(&mut self) -> Result<f64> {
@@ -1033,17 +1334,35 @@ fn sequence(mut xs: Vec<(Pattern, f64)>) -> Pattern {
         Pattern::new(Node::Sequence(xs))
     }
 }
-fn unpack(p: Pattern) -> Vec<Pattern> {
-    if let Node::Sequence(xs) = &*p.0 {
-        xs.iter().map(|x| x.0.clone()).collect()
-    } else {
-        vec![p]
-    }
-}
-fn alternate(p: Pattern) -> Pattern {
-    if let Node::Stack(xs) = &*p.0 {
-        Pattern::stack(xs.iter().cloned().map(alternate).collect())
-    } else {
-        Pattern::new(Node::Alternate(unpack(p)))
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn irand_samples_step_midpoints_independently_of_query_slices() {
+        let pattern = Pattern::irand(5, 7).unwrap();
+        let whole = pattern.query(-1., 2.).unwrap();
+        assert_eq!(whole.len(), 21);
+        for hap in &whole {
+            let midpoint = (hap.whole.begin + hap.whole.end) * 0.5;
+            assert_eq!(
+                hap.value,
+                Value::Number((time_hash(midpoint, 0) * 5.).floor())
+            );
+        }
+        for (begin, end) in [(0.31, 0.79), (-0.93, -0.11), (1., 1.5)] {
+            let expected: Vec<_> = whole
+                .iter()
+                .filter_map(|hap| {
+                    hap.part.intersect(TimeSpan { begin, end }).map(|part| Hap {
+                        part,
+                        ..hap.clone()
+                    })
+                })
+                .collect();
+            assert_eq!(pattern.query(begin, end).unwrap(), expected);
+        }
+        assert!(Pattern::irand(5, 4096).unwrap().query(0., 100.).is_err());
     }
 }

@@ -80,7 +80,7 @@ pub(crate) fn parse(source: &str) -> Result<Program> {
         let mut previous = ' ';
         let mut end = raw.len();
         for (at, c) in raw.char_indices() {
-            if matches!(c, '\'' | '"' | '`') {
+            if matches!(c, '"' | '`') {
                 if quote == Some(c) {
                     quote = None
                 } else if quote.is_none() {
@@ -121,11 +121,17 @@ pub(crate) fn parse(source: &str) -> Result<Program> {
             "play" | "beat" => program.plays.push(play(header, body)?),
             "bus" => {
                 let name = identifier(header, 1)?;
+                if header.text.split_whitespace().count() != 2 {
+                    return Err(header.error("bus expects a name and no extra arguments"));
+                }
                 let mut sends = BTreeMap::new();
                 let mut fx = Vec::new();
                 for line in body {
                     if line.word() == "send" {
                         let target = identifier(line, 1)?;
+                        if line.text.split_whitespace().count() != 3 {
+                            return Err(line.error("send expects a synth name and an amount"));
+                        }
                         let amount = line
                             .text
                             .split_whitespace()
@@ -160,8 +166,12 @@ pub(crate) fn parse(source: &str) -> Result<Program> {
                     return Err(header.error("section length must be positive"));
                 }
                 let tail: Vec<_> = header.text.split_whitespace().skip(3).collect();
-                if !tail.is_empty() && tail[0] != "with" {
-                    return Err(header.error("expected `with SECTION`"));
+                let mut layers = Vec::new();
+                for pair in tail.chunks(2) {
+                    if pair.len() != 2 || pair[0] != "with" || !valid_name(pair[1]) {
+                        return Err(header.error("expected `with SECTION` for each section layer"));
+                    }
+                    layers.push(pair[1].to_owned());
                 }
                 let mut plays = Vec::new();
                 let mut n = 0;
@@ -177,11 +187,11 @@ pub(crate) fn parse(source: &str) -> Result<Program> {
                 program.sections.push(Section {
                     name,
                     len,
-                    layers: tail.into_iter().skip(1).map(str::to_owned).collect(),
+                    layers,
                     plays,
                 });
             }
-            "js" | "sing" | "visual" | "mask" | "draw" | "out" => {
+            "js" | "sing" | "visual" | "mask" | "draw" | "out" | "zonedef" => {
                 return Err(header.error(format!(
                     "`{}` is not supported by the native audio renderer",
                     header.word()
@@ -234,12 +244,27 @@ pub(crate) fn number(text: &str, line: &Line) -> Result<f64> {
     Ok(n)
 }
 pub(crate) fn options(text: &str, line: &Line) -> Result<BTreeMap<String, f64>> {
+    numeric_options(text, line, &[])
+}
+fn numeric_options(text: &str, line: &Line, flags: &[&str]) -> Result<BTreeMap<String, f64>> {
     let mut out = BTreeMap::new();
-    for token in text.split_whitespace() {
-        let (key, value) = token
-            .split_once(':')
-            .ok_or_else(|| line.error("expected name:value"))?;
-        if out.insert(key.to_owned(), number(value, line)?).is_some() {
+    let spaced = text.replace(':', " : ");
+    let mut fields = spaced.split_whitespace();
+    while let Some(key) = fields.next() {
+        let value = if flags.contains(&key) {
+            1.
+        } else {
+            if fields.next() != Some(":") {
+                return Err(line.error("expected name:value"));
+            }
+            number(
+                fields
+                    .next()
+                    .ok_or_else(|| line.error("option needs a value"))?,
+                line,
+            )?
+        };
+        if out.insert(key.to_owned(), value).is_some() {
             return Err(line.error(format!("duplicate option `{key}`")));
         }
     }
@@ -247,19 +272,29 @@ pub(crate) fn options(text: &str, line: &Line) -> Result<BTreeMap<String, f64>> 
 }
 fn synth(header: &Line, body: &[Line]) -> Result<Synth> {
     let name = identifier(header, 1)?;
-    let mut options = BTreeMap::new();
-    for token in header.text.split_whitespace().skip(2) {
-        if token == "mono" {
-            options.insert("mono".into(), 1.0);
-            continue;
-        }
-        let (key, value) = token
-            .split_once(':')
-            .ok_or_else(|| header.error("expected a synth voice option"))?;
-        if !matches!(key, "glide" | "unison" | "detune" | "spread" | "voices") {
+    let tail = header
+        .text
+        .split_whitespace()
+        .skip(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let options = numeric_options(&tail, header, &["mono"])?;
+    for key in options.keys() {
+        if !matches!(
+            key.as_str(),
+            "mono"
+                | "glide"
+                | "unison"
+                | "detune"
+                | "spread"
+                | "curve"
+                | "blend"
+                | "octaves"
+                | "humanize"
+                | "voices"
+        ) {
             return Err(header.error(format!("unsupported voice option `{key}`")));
         }
-        options.insert(key.into(), number(value, header)?);
     }
     let post_at = body.iter().position(|l| l.text == "post");
     let (voice, post) = if let Some(n) = post_at {
@@ -374,7 +409,12 @@ pub(crate) fn chain(lines: &[Line], initial: Option<Expr>) -> Result<Chain> {
         }
         if let Some((name, text)) = line.text.split_once('=') {
             let name = name.trim();
-            if !valid_name(name) || matches!(name, "note" | "gate" | "input" | "velocity") {
+            if !valid_name(name)
+                || matches!(
+                    name,
+                    "note" | "gate" | "input" | "velocity" | "adsr" | "knob" | "switch" | "sum"
+                )
+            {
                 return Err(line.error("invalid or reserved binding name"));
             }
             let expr = expression(text.trim(), line, None)?;

@@ -164,16 +164,50 @@ retain shared delay/reverb tails.
 | Sources and envelopes | `sample`, `granular`, `pluck`, `modal`, `adsr`, breakpoint `env` |
 | Filtering and dynamics | `svf`, `dualsvf`, `ladder`, `onepole`, `formant`, `eq`, `compress`, `limiter`, `follow`, `noisegate`, `transient`, `deess`, `ott` |
 | Effects | `delay`, `comb`, Freeverb `reverb`, partitioned FFT `convolve`, `chorus`, `flanger`, `phaser`, `pitchshift`, `vocoder`, `looper`, `tape`, `exciter`, `bitcrush`, `shape`, `pan`, `width` |
-| Mini notation | Nested sequences `[]`, stacks `,`, alternation `<>`, choice `\|`, rests `~`, weights `@`, elongation `_`, repetition `!`, speed `*`/`/`, Euclidean rhythms, ranges, dot groups, polymeters, and degradation `?` |
-| Pattern modifiers | `rev`, `fast`, `slow`, `early`, `late`, `euclid`, `euclidinv`, `ply`, `roll`, `iter`, `iterback`, `segment`, `struct`, `mask`, `linger`, `palindrome`, `degrade`, `degradeby`, `undegradeby`, `every`, `off`, `superimpose`, `jux`, `juxby`, `sometimes`, `sometimesby`, `often`, `rarely`, `always`, `add`, `sub`, `octave`, `swing`, `swingby`, `echo`, `arp`, `chop`, `striate` |
-| Pitch and controls | Built-in and custom scales, microtonal cents/ratios/EDO, chords, gain/duration/pan, mini control patterns, continuous control signals, named curves, and per-note lanes such as `0'gain:.8'cutoff:900` |
-| Voices | Polyphony and voice stealing, `mono`, `glide`, `unison`, `detune`, `spread`, `voices`, explicit `slide` controls |
+| Mini notation | Nested sequences `[]`, stacks `,`, weighted alternation `<>` and choice `\|`, rests `~`, weights `@`, elongation `_`, repetition `!`, speed `*`/`/`, Euclidean rhythms (negative pulses invert), ranges, dot groups, polymeters, degradation `?`, inline `$name` motifs, and group timing lanes |
+| Pattern modifiers | `rev`, `fast`, `slow`, `early`, `late`, `euclid`, `euclidinv`, `ply`, `roll`, `iter`, `iterback`, `segment`, `struct`, `mask`, `linger`, `palindrome`, `degrade`, `degradeby`, `undegradeby`, `every`, `off`, `superimpose`, `jux`, `juxby`, `sometimes`, `sometimesby`, `often`, `rarely`, `always`, `add`, `sub`, `mul`, `div`, `octave`, `swing`, `swingby`, `humanizeby`, `echo`, `ping`, `onsetsonly`, `arp`, `chop`, `striate` |
+| Pitch and controls | All 16 built-in scale families and seven short aliases, custom scales, microtonal cents/ratios/EDO, chords with slash basses, `irand N [seg:M]` random degrees, gain/duration/pan, mini control patterns, continuous control signals, named curves, and per-note lanes such as `0'gain:.8'cutoff:900` |
+| Voices | Polyphony and voice stealing, `mono`, `glide`, `unison`, `detune`, `spread`, `curve`, `blend`, `octaves`, `humanize`, `voices`, explicit `slide` controls |
 
 The pattern engine is also available directly through `rondorust::pattern`.
 Queries return events with their complete `whole` span and the queried `part`.
 Random choices are deterministic and independent of query order. `every n`
 transforms cycles numbered `0, n, 2n, ...`, matching upstream. `mul` and `div`
 leave note control maps unchanged, as upstream does; `add` and `sub` transpose.
+
+Use `irand 5 seg:16` as a notation line in a `play` block with a scale, such as
+`scale: a-min`, to generate degrees 0 through 4 at sixteen steps per cycle.
+Omitting `seg:` gives eight steps; `seg:` accepts 1–4096. Values are sampled at
+each step's midpoint and stay deterministic across renders and query slices.
+
+The synth option `humanize:.3` adds deterministic per-voice pitch drift and
+holds the gate low briefly at each onset. At `humanize:1`, the bounds are
+±8 cents and 0–14 ms; `humanize:0` preserves the original audio exactly.
+The amount must be in 0–1. Offsets depend on the voice slot and note, and a
+mono slide keeps its current pitch offset without another onset delay.
+`Song::events` reports the scheduled notes before per-voice humanization.
+
+Group timing uses `[c4*8]'swing:.5'grid:4` or
+`[c4*8]'humanize:.2'grid:8`; the default grid is four. `humanizeBy .2 8`
+provides the same pattern jitter as the group lane, with an optional third
+integer seed (default 46). Group `'push:` delays the whole group in its local
+slot; a bare note's `'push:` may also move it early. `swing`, `humanize`, and
+`grid` lanes require a group. A motif such as `$a=[c4 e4] $a ~ $a` defines one
+term before the played pattern and consumes no time of its own.
+
+`arp` accepts `up` (default), `down`, `updown`, `downup`, `updowninc`, and
+`converge`. `ping` takes the same count/delay/decay arguments as `echo` and pans
+successive taps right and left. Scales accept `c-maj`, `c_maj`, and the
+compact root/mode forms; `dor`, `phr`, `lyd`, `mix`, and `loc` are mode aliases too.
+`<c4@3 e4>` sustains C for three cycles; `c4@3 | e4` chooses C three times as
+often. Stack and choice separators need separate bracketed groups.
+
+Unison defaults to 15 cents detune and 0.6 spread. `curve:2` pulls inner
+voices toward the note, `blend:.7` reduces edge-voice gain, and `octaves:2`
+raises every second member an octave. Mono glide operates in semitone space
+and bends only tied/overlapping notes; ordinary retriggers snap to pitch.
+Sample and granular playback follow the same voice pitch offsets.
+`width mode:tight` uses a 3 ms decorrelation delay; `mode:wide` uses 12 ms.
 
 ### Compatibility boundaries
 
@@ -188,10 +222,10 @@ The following are not implemented in this version:
 
 - JavaScript/TypeScript escapes, browser/editor UI, visual rendering, MIDI I/O,
   neural `sing`/`ddsp`, and microphone input.
-- `zonedef` multisampling, upstream's extended wavetable presets and warping,
-  and additional synth voicing/humanization options.
-- `voicing`, `voicelead`, `invert`, `slur`, `chunk`, `humanizeby`, `ping`, and
-  `onsetsonly` modifiers. Arpeggiation supports `up` and `down`.
+- `zonedef` multisampling and upstream's extended wavetable presets and
+  warping (`warp`/`warpamt`). Native wavetables support `basic` and `wavedef`.
+- `voicing`, `voicelead`, `invert`, `slur`, and `chunk` modifiers, plus the
+  `overchord:` control.
 - Pattern-valued arguments to most modifier lines. Mini-notation speed and
   Euclidean arguments may be patterned; the corresponding modifier lines take
   scalar arguments. Nested `every`, and `every` around parallel modifiers such
@@ -201,9 +235,57 @@ The following are not implemented in this version:
 
 Unsupported syntax returns an error. Resource-dependent errors such as missing
 samples and invalid notes can arise when scheduling or rendering after parsing.
+Misspelled controls fail during scheduling instead of silently disappearing;
+custom parameter lanes need a knob or macro used by the routed synth's graph.
 Numeric degree patterns require a scale; include a note name in the pattern to
 use absolute MIDI pitches. Samples come from the host's `SampleBank`; no network
 sample fetching or upstream demo sample pack is bundled.
+
+Some accepted features have narrower or different behavior: `arp` splits named
+chord atoms, while comma-stacked notes keep their independent events. Discrete
+control patterns are sampled at note onsets and do not subdivide sustained
+notes into finer control events. Native unison gain is normalized by
+`1/sqrt(N)`; upstream sums the members without that normalization. Voice
+allocation/retrigger state and random streams also differ. Knob `log`/`linear`
+curves, play `cycles:`, and looper `name:` carry host/editor metadata; native
+parameter bounds still clamp values and render duration comes from
+`RenderOptions`. Language limits include notes in -256..256, 64 voices per
+synth, 16 unison members, and pattern grids/counts up to 4096. Resource limits
+reject some scores that upstream accepts; render limits are listed below.
+
+### Reproducible compatibility audit
+
+The pinned upstream language surface is classified in
+[`tests/compatibility.rs`](tests/compatibility.rs):
+
+| Surface | Native fixtures | Explicit remaining gaps |
+| --- | --- | --- |
+| DSP builtins | 63 of 65 | `mic`, `ddsp` |
+| Named DSP options | 115 of 135 | 18 options on `mic`/`ddsp`; `wavetable` `warp`/`warpamt` |
+| Block directives | 19 of 26 | `sing`, `out`, `zonedef`, `visual`, `mask`, `draw`, `js` |
+| Modifiers, normalized across aliases | 42 of 47 | `chunk`, `invert`, `slur`, `voicelead`, `voicing` |
+| Voice flags/options | 10 of 10 | None |
+| Registered continuous control signals | 12 of 12 | None |
+| Scale families / short aliases / chord qualities | 16 / 7 / 44 | None |
+
+The tests also cover special expressions, DSP enum values, the upstream
+23-case notation gauntlet, malformed arguments, timing, pitch, and selected
+audio measurements. All six upstream `.rondo` example files render. These
+checks establish language coverage and selected behavior; they do not prove
+sample-identical audio across engines.
+
+Given a local checkout at the revision in `NOTICE.md`, reproduce the registry
+comparison without running upstream JavaScript or fetching dependencies:
+
+```sh
+python3 scripts/audit_compatibility.py /path/to/rondocode
+cargo test --test compatibility --test patterns
+```
+
+The script prints a JSON inventory and fails if the reference revision changes
+or any registry entry, named option, voice option, signal, scale, or chord
+quality lacks a classified fixture. Run the Rust tests as well to verify those
+fixtures actually parse, schedule, and render.
 
 ## Supply samples and impulse responses
 

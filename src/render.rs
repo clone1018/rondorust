@@ -180,12 +180,15 @@ struct Voice {
     age: u64,
     silent: usize,
     off_frames: usize,
+    humanize_mul: f64,
+    pending_samples: usize,
 }
 struct Strip {
     def: SynthDef,
     voices: Vec<Voice>,
     post: Option<GraphInstance>,
     clock: u64,
+    sample_rate: u32,
 }
 impl Strip {
     fn new(def: &SynthDef, options: &RenderOptions) -> Result<Self> {
@@ -215,6 +218,8 @@ impl Strip {
                     age: 0,
                     silent: 0,
                     off_frames: 0,
+                    humanize_mul: 1.,
+                    pending_samples: 0,
                 })
             })
             .collect::<Result<_>>()?;
@@ -228,6 +233,7 @@ impl Strip {
             voices,
             post,
             clock: 0,
+            sample_rate: options.sample_rate,
         })
     }
     fn param(&mut self, name: &str, value: f64) {
@@ -244,13 +250,13 @@ impl Strip {
             for (n, voice) in self.voices.iter_mut().enumerate().take(self.def.unison) {
                 if voice.active {
                     voice.note = note;
-                    voice.target = crate::midi_to_frequency(
-                        note + detune_offset(n, self.def.unison, self.def.detune) / 100.,
-                    );
+                    voice.target =
+                        crate::midi_to_frequency(note + detune_offset(n, &self.def) / 100.)
+                            * voice.humanize_mul;
                     if self.def.glide == 0. {
                         voice.frequency = voice.target;
                     }
-                    voice.gain = gain / (self.def.unison as f64).sqrt();
+                    voice.gain = gain * unison_gain(n, &self.def) / (self.def.unison as f64).sqrt();
                     voice.age = self.clock;
                     voice.pan =
                         (pan + spread_offset(n, self.def.unison, self.def.spread)).clamp(0., 1.);
@@ -290,11 +296,20 @@ impl Strip {
             voice.active = true;
             voice.gate = true;
             voice.note = note;
-            voice.target = crate::midi_to_frequency(
-                note + detune_offset(member, self.def.unison, self.def.detune) / 100.,
-            );
+            if self.def.humanize > 0. {
+                let cents =
+                    (voice_hash(index, note, 0x1f2e3d4c) * 2. - 1.) * 8. * self.def.humanize;
+                voice.humanize_mul = 2_f64.powf(cents / 1200.);
+                voice.pending_samples = (voice_hash(index, note, 0x7a5c9b31)
+                    * 0.014
+                    * self.def.humanize
+                    * f64::from(self.sample_rate))
+                .round() as usize;
+            }
+            voice.target = crate::midi_to_frequency(note + detune_offset(member, &self.def) / 100.)
+                * voice.humanize_mul;
             voice.frequency = voice.target;
-            voice.gain = gain / (self.def.unison as f64).sqrt();
+            voice.gain = gain * unison_gain(member, &self.def) / (self.def.unison as f64).sqrt();
             voice.pan =
                 (pan + spread_offset(member, self.def.unison, self.def.spread)).clamp(0., 1.);
             voice.begin = begin;
@@ -308,13 +323,14 @@ impl Strip {
         for voice in &mut self.voices {
             if voice.active && (voice.note - note).abs() < 1e-7 {
                 voice.gate = false;
+                voice.pending_samples = 0;
                 voice.off_frames = 0;
             }
         }
     }
     fn process(&mut self, sr: f64, cps: f64) -> Stereo {
         let mut sum = [0.; 2];
-        let glide = if self.def.glide > 0. {
+        let glide = if self.def.mono && self.def.glide > 0. {
             1. - (-1. / (self.def.glide * sr)).exp()
         } else {
             1.
@@ -323,11 +339,18 @@ impl Strip {
             if !voice.active {
                 continue;
             }
-            voice.frequency += (voice.target - voice.frequency) * glide;
+            if glide == 1. {
+                voice.frequency = voice.target;
+            } else if voice.frequency != voice.target {
+                let pitch = voice.frequency.log2();
+                voice.frequency = 2_f64.powf(pitch + (voice.target.log2() - pitch) * glide);
+            }
+            let gate = voice.gate && voice.pending_samples == 0;
+            voice.pending_samples = voice.pending_samples.saturating_sub(1);
             let ctx = Context {
                 frequency: voice.frequency,
                 note: voice.note,
-                gate: voice.gate,
+                gate,
                 velocity: voice.gain,
                 sample_rate: sr,
                 cps,
@@ -369,12 +392,42 @@ impl Strip {
         sum
     }
 }
-fn detune_offset(member: usize, count: usize, detune: f64) -> f64 {
-    if count <= 1 {
+// Upstream's avalanche hash keys the offsets by pool slot and MIDI note.
+fn voice_hash(slot: usize, note: f64, salt: u32) -> f64 {
+    let mut h = (slot as u32).wrapping_add(1).wrapping_mul(0x9e3779b1)
+        ^ ((note + 1.) as i64 as u32).wrapping_mul(0x85ebca6b)
+        ^ salt;
+    h = (h ^ (h >> 15)).wrapping_mul(0x2c1b3c6d);
+    h ^= h >> 12;
+    h = (h ^ (h >> 13)).wrapping_mul(0x297a2d39);
+    h ^= h >> 16;
+    f64::from(h) / 4_294_967_296.
+}
+fn detune_offset(member: usize, def: &SynthDef) -> f64 {
+    let frac = if def.unison <= 1 {
         0.
     } else {
-        (member as f64 / (count - 1) as f64 * 2. - 1.) * detune
-    }
+        member as f64 / (def.unison - 1) as f64 * 2. - 1.
+    };
+    let warped = if def.curve == 1. || frac == 0. {
+        frac
+    } else {
+        frac.signum() * frac.abs().powf(def.curve)
+    };
+    warped * def.detune
+        + if def.octaves >= 2 && (member + 1).is_multiple_of(def.octaves) {
+            1200.
+        } else {
+            0.
+        }
+}
+fn unison_gain(member: usize, def: &SynthDef) -> f64 {
+    let frac = if def.unison <= 1 {
+        0.
+    } else {
+        member as f64 / (def.unison - 1) as f64 * 2. - 1.
+    };
+    1. - (1. - def.blend) * frac.abs()
 }
 fn spread_offset(member: usize, count: usize, spread: f64) -> f64 {
     if count <= 1 {
@@ -446,7 +499,8 @@ impl AudioStream {
             .synths
             .iter()
             .map(|s| {
-                s.graph.storage_bytes(sr, &options.samples) * options.max_voices.min(s.voices)
+                (s.graph.storage_bytes(sr, &options.samples) + std::mem::size_of::<Voice>())
+                    * options.max_voices.min(s.voices)
                     + s.post
                         .as_ref()
                         .map(|g| g.storage_bytes(sr, &options.samples))
@@ -497,6 +551,19 @@ impl AudioStream {
     pub fn set_param(&mut self, name: &str, value: f64) -> Result<()> {
         if !value.is_finite() {
             return Err(Error::invalid("parameter must be finite"));
+        }
+        let known = self.data.synths.iter().any(|s| {
+            s.graph.params.iter().any(|p| p.name == name)
+                || s.post
+                    .as_ref()
+                    .is_some_and(|g| g.params.iter().any(|p| p.name == name))
+        }) || self
+            .data
+            .buses
+            .iter()
+            .any(|b| b.graph.params.iter().any(|p| p.name == name));
+        if !known {
+            return Err(Error::invalid(format!("unknown parameter `{name}`")));
         }
         for strip in &mut self.strips {
             strip.param(name, value);
