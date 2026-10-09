@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag and package version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              package = tomllib.load(manifest)["package"]
+          version = package["version"]
+          tag = os.environ["RELEASE_TAG"]
+          if tag != f"v{version}":
+              sys.exit(f"Tag {tag!r} must match Cargo.toml version: v{version}")
+          with open("Cargo.lock", "rb") as lockfile:
+              packages = tomllib.load(lockfile)["package"]
+          if not any(p["name"] == package["name"] and p["version"] == version for p in packages):
+              sys.exit("Cargo.lock must contain the same package version as Cargo.toml")
+          with open("CHANGELOG.md") as changelog:
+              if not any(line.startswith(f"## [{version}] - ") for line in changelog):
+                  sys.exit(f"CHANGELOG.md must contain release notes for {version}")
+          prerelease = "-" in version.split("+", 1)[0]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"prerelease={str(prerelease).lower()}", file=output)
+          print(f"Releasing {package['name']} {version}")
+          PY
+
+  checks:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: [version, checks]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify crate packaging
+        run: cargo publish --locked --dry-run
+      - name: Publish crate
+        run: |
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo "Set the CARGO_REGISTRY_TOKEN repository secret before releasing" >&2
+            exit 1
+          fi
+          cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  github-release:
+    needs: [version, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import tomllib
+
+          version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          lines = Path("CHANGELOG.md").read_text().splitlines()
+          start = next(i for i, line in enumerate(lines) if line.startswith(f"## [{version}] - ")) + 1
+          end = next((i for i in range(start, len(lines)) if lines[i].startswith("## ")), len(lines))
+          Path("release-notes.md").write_text("\n".join(lines[start:end]).strip() + "\n")
+          PY
+          args=(--verify-tag --title "$RELEASE_TAG" --notes-file release-notes.md --generate-notes)
+          if [[ "$PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" "${args[@]}"

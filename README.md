@@ -21,7 +21,7 @@ Add the crate with its Bevy integration enabled:
 ```toml
 [dependencies]
 bevy = "0.19"
-rondorust = { version = "0.1", features = ["bevy"] }
+rondorust = { version = "0.2", features = ["bevy"] }
 ```
 
 Register `RondocodePlugin` after `DefaultPlugins`, then load a `.rondo` or
@@ -416,6 +416,35 @@ frequency measurements, retriggers, deterministic rendering, sample playback,
 direct-versus-FFT convolution, effect bypass, malformed input, WAV structure,
 Bevy asset loading, and independent decoder cursors. See
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for the layout and contribution guidance.
+
+## Releasing
+
+Pushing a `v*` tag runs the full CI suite, verifies the crate package, publishes
+to crates.io, and creates a GitHub release with the matching
+[`CHANGELOG.md`](CHANGELOG.md) entry and generated notes. The tag must
+match the version in `Cargo.toml` and `Cargo.lock`; prerelease versions create
+prerelease GitHub releases.
+
+For each release, update the package version in `Cargo.toml`, run
+`cargo check` to update `Cargo.lock`, and update
+the README dependency examples when the compatible version changes. Add a
+`## [VERSION] - YYYY-MM-DD` entry to `CHANGELOG.md`, including migration notes
+for breaking changes. Commit and push those changes, then tag that commit.
+For example, after bumping to `0.2.0`:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+Authentication uses the encrypted GitHub Actions repository secret
+`CARGO_REGISTRY_TOKEN`. Configure it once with a crates.io API token that can
+publish `rondorust`, and replace the secret when the token expires or is rotated.
+The token is exposed only to the publishing step in the tag-triggered workflow.
+
+If GitHub release creation fails after publishing, rerun only the failed jobs in
+Actions. Published crates.io versions cannot be overwritten; corrections need
+a new version and tag.
 
 MIT licensed. The original rondocode copyright is preserved in
 [`LICENSE`](LICENSE); see [`NOTICE.md`](NOTICE.md) for attribution.

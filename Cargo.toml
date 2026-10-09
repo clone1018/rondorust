@@ -1,6 +1,6 @@
 [package]
 name = "rondorust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Native Rust rondocode synthesis and pattern rendering, with Bevy audio assets"
@@ -10,7 +10,7 @@ license = "MIT"
 readme = "README.md"
 keywords = ["bevy", "audio", "synthesizer", "rondocode", "music"]
 categories = ["game-development", "multimedia::audio"]
-include = ["src/**", "tests/**", "scripts/**", "examples/**", "assets/**", "README.md", "CONTRIBUTING.md", "LICENSE", "NOTICE.md", "Cargo.toml"]
+include = ["src/**", "tests/**", "scripts/**", "examples/**", "assets/**", "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "LICENSE", "NOTICE.md", "Cargo.toml"]
 
 [package.metadata.docs.rs]
 all-features = true
